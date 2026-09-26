@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<document type="freeswitch/xml">
+  <X-PRE-PROCESS cmd="include" data="vars.xml"/>
+  
+  <section name="configuration" description="Core Configuration">
+    <X-PRE-PROCESS cmd="include" data="autoload_configs/*.xml"/>
+  </section>
+  
+  <section name="dialplan" description="Dynamic Dialplan via mod_xml_curl">
+    <!-- Dialplan is dynamically served by FastAPI /freeswitch/xml -->
+  </section>
+
+  <section name="directory" description="Dynamic Directory via mod_xml_curl">
+    <!-- Directory is dynamically served by FastAPI /freeswitch/xml -->
+  </section>
+</document>

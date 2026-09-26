@@ -1,0 +1,93 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:14-alpine
+    container_name: pbx_postgres
+    environment:
+      POSTGRES_USER: pbx_user
+      POSTGRES_PASSWORD: pbx_password_secure
+      POSTGRES_DB: pbx_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pbx_user -d pbx_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: pbx_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: pbx_api
+    restart: always
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=pbx_user
+      - POSTGRES_PASSWORD=pbx_password_secure
+      - POSTGRES_DB=pbx_db
+      - DATABASE_URL=postgresql+asyncpg://pbx_user:pbx_password_secure@postgres:5432/pbx_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_URL=redis://redis:6379/0
+      - FREESWITCH_ESL_HOST=freeswitch
+      - FREESWITCH_ESL_PORT=8021
+      - FREESWITCH_ESL_PASSWORD=ClueCon
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+      - recording_storage:/var/lib/freeswitch/recordings
+
+  freeswitch:
+    build:
+      context: .
+      dockerfile: Dockerfile.freeswitch
+    container_name: pbx_freeswitch
+    restart: always
+    network_mode: host
+    volumes:
+      - ./config/freeswitch:/etc/freeswitch
+      - recording_storage:/var/lib/freeswitch/recordings
+    depends_on:
+      - api
+
+  nginx:
+    image: nginx:alpine
+    container_name: pbx_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx/default.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  recording_storage:
