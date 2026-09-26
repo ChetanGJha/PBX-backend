@@ -196,3 +196,36 @@ async def delete_audio_file(
 
     await execute_transaction(_delete)
     logger.info(f"Audio file {file_id} deleted by {current_user.username}")
+
+
+@router.get("/{file_id}/stream", summary="Stream / play audio file")
+async def stream_audio_file(file_id: str):
+    """
+    Stream audio file for in-browser playback.
+    Accepts audio file UUID or unique file_name.
+    """
+    row = await execute_query_one(
+        "SELECT * FROM audio_files WHERE CAST(id AS text) = :id OR file_name = :id",
+        {"id": file_id}
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file not found")
+
+    file_path = row.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        file_name = row.get("file_name", "")
+        alt_path = os.path.join(AUDIO_DIR, file_name)
+        if os.path.exists(alt_path):
+            file_path = alt_path
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from server disk")
+
+    ext = os.path.splitext(file_path)[1].lower()
+    media_type = "audio/mpeg" if ext == ".mp3" else ("audio/wav" if ext == ".wav" else "audio/ogg")
+
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=row.get("file_name", "audio" + ext),
+        headers={"Accept-Ranges": "bytes"}
+    )
