@@ -1,127 +1,501 @@
-from typing import Optional, List
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
-
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from pydantic import BaseModel, EmailStr, Field
 from src.core.database import execute_query, execute_query_one
-from src.core.permissions import get_current_user, require_roles, CurrentUser
+from src.core.permissions import get_current_user, CurrentUser, require_roles, validate_tenant_access
+from src.core.security import hash_password
 
-router = APIRouter(prefix="/extensions", tags=["Extensions"])
+router = APIRouter(prefix="/extensions", tags=["Extension Management"])
+
 
 class ExtensionCreate(BaseModel):
-    extension_number: str = Field(..., min_length=2, max_length=20)
-    display_name: str = Field(..., min_length=2, max_length=100)
-    email: Optional[str] = None
-    sip_password: str = Field(..., min_length=6)
-    voicemail_pin: Optional[str] = Field("1234", min_length=4)
-    tenant_id: Optional[UUID] = None
+    tenant_id: Optional[str] = Field(None, description="Tenant ID (derived from user context if omitted)")
+    extension_number: str = Field(..., min_length=2, max_length=20, example="1001")
+    display_name: str = Field(..., min_length=2, max_length=100, example="John Doe")
+    email: Optional[EmailStr] = None
+    sip_password: str = Field(..., min_length=8, description="SIP authentication password")
+    voicemail_pin: Optional[str] = Field("1234", min_length=4, max_length=10)
+    caller_id_name: Optional[str] = None
+    caller_id_number: Optional[str] = None
+    outbound_caller_id: Optional[str] = None
+    emergency_caller_id: Optional[str] = None
+    webrtc_enabled: Optional[bool] = True
+    no_answer_timeout: Optional[int] = 20
 
-class PasswordResetPayload(BaseModel):
-    new_sip_password: Optional[str] = Field(None, min_length=6)
-    new_voicemail_pin: Optional[str] = Field(None, min_length=4)
 
-class ExtensionSettingsPayload(BaseModel):
-    voicemail_email: Optional[str] = None
-    voicemail_to_email: bool = False
-    follow_me_enabled: bool = False
-    follow_me_destination: Optional[str] = None
-    follow_me_timeout: int = 20
-    call_forward_enabled: bool = False
-    call_forward_type: str = "always"  # always, busy, no_answer
-    call_forward_destination: Optional[str] = None
+class ExtensionUpdate(BaseModel):
+    display_name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    caller_id_name: Optional[str] = None
+    caller_id_number: Optional[str] = None
+    outbound_caller_id: Optional[str] = None
+    emergency_caller_id: Optional[str] = None
+    enabled: Optional[bool] = None
+    webrtc_enabled: Optional[bool] = None
+    no_answer_timeout: Optional[int] = None
 
-@router.get("")
-async def list_extensions(
-    tenant_id: Optional[UUID] = None,
-    current_user: CurrentUser = Depends(get_current_user)
-):
-    target_tenant = tenant_id if current_user.is_super_admin else current_user.tenant_id
-    query = """
-        SELECT e.id, e.extension_number, e.display_name, e.email, e.enabled,
-               e.voicemail_email, e.voicemail_to_email, e.follow_me_enabled,
-               e.follow_me_destination, e.follow_me_timeout, e.call_forward_enabled,
-               e.call_forward_type, e.call_forward_destination, e.created_at::text,
-               t.name as tenant_name, t.domain as tenant_domain
-        FROM extensions e
-        LEFT JOIN tenants t ON e.tenant_id = t.id
-        WHERE e.deleted_at IS NULL
-    """
-    params = {}
-    if target_tenant:
-        query += " AND e.tenant_id = CAST(:t_id AS uuid)"
-        params["t_id"] = target_tenant
 
-    query += " ORDER BY e.extension_number ASC"
-    rows = await execute_query(query, params)
-    return [dict(r) for r in rows]
+class ResetPasswordPayload(BaseModel):
+    new_sip_password: Optional[str] = Field(None, min_length=8)
+    new_voicemail_pin: Optional[str] = Field(None, min_length=4, max_length=10)
+
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_extension(
     payload: ExtensionCreate,
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
 ):
-    target_tenant = payload.tenant_id if current_user.is_super_admin else current_user.tenant_id
-    if not target_tenant:
-        raise HTTPException(status_code=400, detail="Tenant ID is required to create extension.")
+    """
+    Create a new extension within the caller's tenant context.
+    """
+    target_tenant_id = payload.tenant_id if current_user.is_super_admin and payload.tenant_id else current_user.tenant_id
+    if not target_tenant_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tenant ID context missing")
+
+    validate_tenant_access(current_user, target_tenant_id)
+
+    # Check extension quota limit
+    tenant = await execute_query_one(
+        "SELECT max_extensions FROM tenants WHERE id = :id AND deleted_at IS NULL",
+        {"id": target_tenant_id}
+    )
+    if not tenant:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+
+    ext_count = await execute_query_one(
+        "SELECT COUNT(*) as cnt FROM extensions WHERE tenant_id = :id AND deleted_at IS NULL",
+        {"id": target_tenant_id}
+    )
+    if ext_count and ext_count["cnt"] >= tenant["max_extensions"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Extension limit reached ({tenant['max_extensions']} max extensions allowed for this tenant)"
+        )
+
+    # Check extension number uniqueness within tenant
+    existing = await execute_query_one(
+        "SELECT id FROM extensions WHERE tenant_id = :tenant_id AND extension_number = :num AND deleted_at IS NULL",
+        {"tenant_id": target_tenant_id, "num": payload.extension_number}
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Extension number '{payload.extension_number}' already exists in this tenant"
+        )
 
     query = """
-        INSERT INTO extensions (extension_number, display_name, email, sip_password, voicemail_pin, tenant_id)
-        VALUES (:extension_number, :display_name, :email, :sip_password, :voicemail_pin, CAST(:tenant_id AS uuid))
-        RETURNING id, extension_number, display_name, email, enabled, created_at::text
+        INSERT INTO extensions (
+            tenant_id, extension_number, display_name, email, sip_password, voicemail_pin,
+            caller_id_name, caller_id_number, outbound_caller_id, emergency_caller_id,
+            webrtc_enabled, no_answer_timeout
+        )
+        VALUES (
+            :tenant_id, :extension_number, :display_name, :email, :sip_password, :voicemail_pin,
+            :caller_id_name, :caller_id_number, :outbound_caller_id, :emergency_caller_id,
+            :webrtc_enabled, :no_answer_timeout
+        )
+        RETURNING id, tenant_id, extension_number, display_name, email, caller_id_name,
+                  caller_id_number, outbound_caller_id, enabled, webrtc_enabled, no_answer_timeout, created_at
     """
-    data = payload.dict()
-    data["tenant_id"] = target_tenant
-    row = await execute_query_one(query, data)
+    row = await execute_query_one(query, {
+        "tenant_id": target_tenant_id,
+        "extension_number": payload.extension_number,
+        "display_name": payload.display_name,
+        "email": payload.email,
+        "sip_password": payload.sip_password,
+        "voicemail_pin": payload.voicemail_pin or "1234",
+        "caller_id_name": payload.caller_id_name or payload.display_name,
+        "caller_id_number": payload.caller_id_number or payload.extension_number,
+        "outbound_caller_id": payload.outbound_caller_id,
+        "emergency_caller_id": payload.emergency_caller_id,
+        "webrtc_enabled": payload.webrtc_enabled if payload.webrtc_enabled is not None else True,
+        "no_answer_timeout": payload.no_answer_timeout or 20
+    })
+
     return dict(row)
 
-@router.post("/{extension_id}/reset-password")
-async def reset_extension_password(
-    extension_id: UUID,
-    payload: PasswordResetPayload,
-    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+
+@router.get("")
+async def list_extensions(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: CurrentUser = Depends(get_current_user)
 ):
+    """
+    List all extensions for authenticated user's tenant.
+    """
+    target_tenant_id = current_user.tenant_id
+    if current_user.is_super_admin:
+        query = """
+            SELECT e.id, e.tenant_id, t.name as tenant_name, e.extension_number, e.display_name,
+                   e.email, e.caller_id_name, e.caller_id_number, e.outbound_caller_id,
+                   e.enabled, e.webrtc_enabled, e.created_at
+            FROM extensions e
+            JOIN tenants t ON e.tenant_id = t.id
+            WHERE e.deleted_at IS NULL
+            ORDER BY t.name ASC, e.extension_number ASC
+            OFFSET :skip LIMIT :limit
+        """
+        rows = await execute_query(query, {"skip": skip, "limit": limit})
+    else:
+        if not target_tenant_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant context found")
+        query = """
+            SELECT id, tenant_id, extension_number, display_name, email, caller_id_name,
+                   caller_id_number, outbound_caller_id, enabled, webrtc_enabled, created_at
+            FROM extensions
+            WHERE tenant_id = :tenant_id AND deleted_at IS NULL
+            ORDER BY extension_number ASC
+            OFFSET :skip LIMIT :limit
+        """
+        rows = await execute_query(query, {"tenant_id": target_tenant_id, "skip": skip, "limit": limit})
 
-    updates = []
-    params = {"id": extension_id}
-    if payload.new_sip_password:
-        updates.append("sip_password = :sip_password")
-        params["sip_password"] = payload.new_sip_password
-    if payload.new_voicemail_pin:
-        updates.append("voicemail_pin = :voicemail_pin")
-        params["voicemail_pin"] = payload.new_voicemail_pin
+    return [dict(r) for r in rows]
 
-    if not updates:
-        raise HTTPException(status_code=400, detail="No new credentials provided.")
 
-    query = f"UPDATE extensions SET {', '.join(updates)}, updated_at = NOW() WHERE id = CAST(:id AS uuid) RETURNING id, extension_number"
-    row = await execute_query_one(query, params)
+@router.get("/{extension_id}")
+async def get_extension(
+    extension_id: str,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Get extension detailed configuration.
+    """
+    query = """
+        SELECT id, tenant_id, user_id, extension_number, display_name, email,
+               caller_id_name, caller_id_number, outbound_caller_id, emergency_caller_id,
+               timezone, enabled, webrtc_enabled, no_answer_timeout, created_at, updated_at
+        FROM extensions
+        WHERE id = :id AND deleted_at IS NULL
+    """
+    row = await execute_query_one(query, {"id": extension_id})
     if not row:
-        raise HTTPException(status_code=404, detail="Extension not found")
-    return {"status": "success", "message": "Credentials updated successfully"}
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Extension not found")
 
-@router.put("/{extension_id}/settings")
-async def update_extension_settings(
-    extension_id: UUID,
-    payload: ExtensionSettingsPayload,
+    validate_tenant_access(current_user, str(row["tenant_id"]))
+    return dict(row)
+
+
+@router.put("/{extension_id}")
+async def update_extension(
+    extension_id: str,
+    payload: ExtensionUpdate,
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
 ):
+    """
+    Update extension configuration.
+    """
+    ext = await execute_query_one("SELECT tenant_id FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Extension not found")
+
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+
     query = """
         UPDATE extensions
-        SET voicemail_email = :voicemail_email,
-            voicemail_to_email = :voicemail_to_email,
-            follow_me_enabled = :follow_me_enabled,
-            follow_me_destination = :follow_me_destination,
-            follow_me_timeout = :follow_me_timeout,
-            call_forward_enabled = :call_forward_enabled,
-            call_forward_type = :call_forward_type,
-            call_forward_destination = :call_forward_destination,
+        SET display_name = COALESCE(:display_name, display_name),
+            email = COALESCE(:email, email),
+            caller_id_name = COALESCE(:caller_id_name, caller_id_name),
+            caller_id_number = COALESCE(:caller_id_number, caller_id_number),
+            outbound_caller_id = COALESCE(:outbound_caller_id, outbound_caller_id),
+            emergency_caller_id = COALESCE(:emergency_caller_id, emergency_caller_id),
+            enabled = COALESCE(:enabled, enabled),
+            webrtc_enabled = COALESCE(:webrtc_enabled, webrtc_enabled),
+            no_answer_timeout = COALESCE(:no_answer_timeout, no_answer_timeout),
             updated_at = NOW()
-        WHERE id = CAST(:id AS uuid)
-        RETURNING id, extension_number, voicemail_email, voicemail_to_email, follow_me_enabled, call_forward_enabled
+        WHERE id = :id AND deleted_at IS NULL
+        RETURNING id, tenant_id, extension_number, display_name, email, caller_id_name,
+                  caller_id_number, outbound_caller_id, enabled, webrtc_enabled, updated_at
     """
-    data = payload.dict()
-    data["id"] = extension_id
-    row = await execute_query_one(query, data)
+    row = await execute_query_one(query, {
+        "id": extension_id,
+        "display_name": payload.display_name,
+        "email": payload.email,
+        "caller_id_name": payload.caller_id_name,
+        "caller_id_number": payload.caller_id_number,
+        "outbound_caller_id": payload.outbound_caller_id,
+        "emergency_caller_id": payload.emergency_caller_id,
+        "enabled": payload.enabled,
+        "webrtc_enabled": payload.webrtc_enabled,
+        "no_answer_timeout": payload.no_answer_timeout
+    })
+
+    return dict(row)
+
+
+@router.post("/{extension_id}/reset-password")
+async def reset_extension_credentials(
+    extension_id: str,
+    payload: ResetPasswordPayload,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Reset SIP authentication password or Voicemail PIN for an extension.
+    """
+    ext = await execute_query_one("SELECT tenant_id FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Extension not found")
+
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+
+    if not payload.new_sip_password and not payload.new_voicemail_pin:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Must provide new SIP password or Voicemail PIN")
+
+    query = """
+        UPDATE extensions
+        SET sip_password = COALESCE(:sip_password, sip_password),
+            voicemail_pin = COALESCE(:voicemail_pin, voicemail_pin),
+            updated_at = NOW()
+        WHERE id = :id AND deleted_at IS NULL
+        RETURNING id, extension_number, updated_at
+    """
+    row = await execute_query_one(query, {
+        "id": extension_id,
+        "sip_password": payload.new_sip_password,
+        "voicemail_pin": payload.new_voicemail_pin
+    })
+
+    return {
+        "message": "Extension credentials updated successfully",
+        "extension_id": str(row["id"]),
+        "extension_number": row["extension_number"]
+    }
+
+
+@router.delete("/{extension_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_extension(
+    extension_id: str,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Soft delete extension.
+    """
+    ext = await execute_query_one("SELECT tenant_id FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Extension not found")
+
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+
+    await execute_query_one(
+        "UPDATE extensions SET deleted_at = NOW(), enabled = false WHERE id = :id",
+        {"id": extension_id}
+    )
+    return None
+
+
+# ─── CALL FORWARDING & FOLLOW-ME ENDPOINTS ───────────────────────────────────
+
+class CallForwardingUpdate(BaseModel):
+    forward_always_enabled: bool = False
+    forward_always_destination: Optional[str] = None
+    forward_busy_enabled: bool = False
+    forward_busy_destination: Optional[str] = None
+    forward_no_answer_enabled: bool = False
+    forward_no_answer_destination: Optional[str] = None
+    forward_no_answer_timeout: int = 20
+
+@router.get("/call-forwarding/all")
+async def get_all_call_forwarding(
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Get call forwarding rules for all extensions in the current tenant.
+    """
+    tenant_filter = "WHERE e.deleted_at IS NULL"
+    params = {}
+    if not current_user.is_super_admin:
+        if not current_user.tenant_id:
+            raise HTTPException(status_code=403, detail="No tenant context")
+        tenant_filter += " AND e.tenant_id = CAST(:t_id AS uuid)"
+        params["t_id"] = current_user.tenant_id
+
+    query = f"""
+        SELECT e.id as extension_id, e.extension_number, e.display_name,
+               COALESCE(cf.forward_always_enabled, false) as forward_always_enabled,
+               cf.forward_always_destination,
+               COALESCE(cf.forward_busy_enabled, false) as forward_busy_enabled,
+               cf.forward_busy_destination,
+               COALESCE(cf.forward_no_answer_enabled, false) as forward_no_answer_enabled,
+               cf.forward_no_answer_destination,
+               COALESCE(cf.forward_no_answer_timeout, 20) as forward_no_answer_timeout,
+               cf.updated_at::text as updated_at
+        FROM extensions e
+        LEFT JOIN call_forwarding cf ON e.id = cf.extension_id
+        {tenant_filter}
+        ORDER BY e.extension_number ASC
+    """
+    rows = await execute_query(query, params)
+    return [dict(r) for r in rows]
+
+@router.get("/{extension_id}/forwarding")
+async def get_extension_forwarding(
+    extension_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    row = await execute_query_one(
+        "SELECT * FROM call_forwarding WHERE extension_id = :ext_id",
+        {"ext_id": extension_id}
+    )
     if not row:
+        return {
+            "extension_id": str(extension_id),
+            "forward_always_enabled": False,
+            "forward_always_destination": None,
+            "forward_busy_enabled": False,
+            "forward_busy_destination": None,
+            "forward_no_answer_enabled": False,
+            "forward_no_answer_destination": None,
+            "forward_no_answer_timeout": 20
+        }
+    return dict(row)
+
+@router.put("/{extension_id}/forwarding")
+async def update_extension_forwarding(
+    extension_id: UUID,
+    payload: CallForwardingUpdate,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN", "AGENT"]))
+):
+    query = """
+        INSERT INTO call_forwarding (
+            extension_id, forward_always_enabled, forward_always_destination,
+            forward_busy_enabled, forward_busy_destination,
+            forward_no_answer_enabled, forward_no_answer_destination,
+            forward_no_answer_timeout, updated_at
+        ) VALUES (
+            :ext_id, :fae, :fad, :fbe, :fbd, :fne, :fnd, :fnt, NOW()
+        )
+        ON CONFLICT (extension_id) DO UPDATE SET
+            forward_always_enabled = EXCLUDED.forward_always_enabled,
+            forward_always_destination = EXCLUDED.forward_always_destination,
+            forward_busy_enabled = EXCLUDED.forward_busy_enabled,
+            forward_busy_destination = EXCLUDED.forward_busy_destination,
+            forward_no_answer_enabled = EXCLUDED.forward_no_answer_enabled,
+            forward_no_answer_destination = EXCLUDED.forward_no_answer_destination,
+            forward_no_answer_timeout = EXCLUDED.forward_no_answer_timeout,
+            updated_at = NOW()
+        RETURNING *
+    """
+    row = await execute_query_one(query, {
+        "ext_id": extension_id,
+        "fae": payload.forward_always_enabled,
+        "fad": payload.forward_always_destination,
+        "fbe": payload.forward_busy_enabled,
+        "fbd": payload.forward_busy_destination,
+        "fne": payload.forward_no_answer_enabled,
+        "fnd": payload.forward_no_answer_destination,
+        "fnt": payload.forward_no_answer_timeout,
+    })
+    return dict(row)
+
+# ─── VOICEMAIL BOXES ENDPOINTS ────────────────────────────────────────────────
+
+class VoicemailBoxUpdate(BaseModel):
+    mailbox: Optional[str] = None
+    password: Optional[str] = None
+    email_notification: bool = True
+    email_attach_file: bool = True
+    email_address: Optional[str] = None
+    delete_after_email: bool = False
+    greeting_path: Optional[str] = None
+
+@router.get("/voicemail-boxes/all")
+async def get_all_voicemail_boxes(
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Get voicemail boxes for all extensions in the current tenant.
+    """
+    tenant_filter = "WHERE e.deleted_at IS NULL"
+    params = {}
+    if not current_user.is_super_admin:
+        if not current_user.tenant_id:
+            raise HTTPException(status_code=403, detail="No tenant context")
+        tenant_filter += " AND e.tenant_id = CAST(:t_id AS uuid)"
+        params["t_id"] = current_user.tenant_id
+
+    query = f"""
+        SELECT e.id as extension_id, e.extension_number, e.display_name, e.email as extension_email,
+               vb.id as voicemail_box_id,
+               COALESCE(vb.mailbox, e.extension_number) as mailbox,
+               COALESCE(vb.email_notification, true) as email_notification,
+               COALESCE(vb.email_attach_file, true) as email_attach_file,
+               COALESCE(vb.email_address, e.email) as email_address,
+               COALESCE(vb.delete_after_email, false) as delete_after_email,
+               vb.greeting_path,
+               vb.created_at::text as created_at
+        FROM extensions e
+        LEFT JOIN voicemail_boxes vb ON e.id = vb.extension_id
+        {tenant_filter}
+        ORDER BY e.extension_number ASC
+    """
+    rows = await execute_query(query, params)
+    return [dict(r) for r in rows]
+
+@router.get("/{extension_id}/voicemail")
+async def get_extension_voicemail(
+    extension_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    row = await execute_query_one(
+        "SELECT * FROM voicemail_boxes WHERE extension_id = :ext_id",
+        {"ext_id": extension_id}
+    )
+    if not row:
+        ext = await execute_query_one("SELECT extension_number, email FROM extensions WHERE id = :ext_id", {"ext_id": extension_id})
+        mailbox_num = ext["extension_number"] if ext else ""
+        return {
+            "extension_id": str(extension_id),
+            "mailbox": mailbox_num,
+            "password": "1234",
+            "email_notification": True,
+            "email_attach_file": True,
+            "email_address": ext.get("email") if ext else None,
+            "delete_after_email": False,
+            "greeting_path": None
+        }
+    return dict(row)
+
+@router.put("/{extension_id}/voicemail")
+async def update_extension_voicemail(
+    extension_id: UUID,
+    payload: VoicemailBoxUpdate,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN", "AGENT"]))
+):
+    ext = await execute_query_one("SELECT tenant_id, extension_number, email FROM extensions WHERE id = :ext_id", {"ext_id": extension_id})
+    if not ext:
         raise HTTPException(status_code=404, detail="Extension not found")
+
+    tenant_id = ext["tenant_id"]
+    mailbox = payload.mailbox or ext["extension_number"]
+    email_addr = payload.email_address or ext.get("email")
+
+    query = """
+        INSERT INTO voicemail_boxes (
+            tenant_id, extension_id, mailbox, password,
+            email_notification, email_attach_file, email_address,
+            delete_after_email, greeting_path
+        ) VALUES (
+            :t_id, :ext_id, :mb, :pwd, :en, :ea, :em, :da, :gp
+        )
+        ON CONFLICT (tenant_id, mailbox) DO UPDATE SET
+            password = COALESCE(EXCLUDED.password, voicemail_boxes.password),
+            email_notification = EXCLUDED.email_notification,
+            email_attach_file = EXCLUDED.email_attach_file,
+            email_address = EXCLUDED.email_address,
+            delete_after_email = EXCLUDED.delete_after_email,
+            greeting_path = EXCLUDED.greeting_path
+        RETURNING *
+    """
+    row = await execute_query_one(query, {
+        "t_id": tenant_id,
+        "ext_id": extension_id,
+        "mb": mailbox,
+        "pwd": payload.password or "1234",
+        "en": payload.email_notification,
+        "ea": payload.email_attach_file,
+        "em": email_addr,
+        "da": payload.delete_after_email,
+        "gp": payload.greeting_path
+    })
     return dict(row)

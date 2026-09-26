@@ -40,7 +40,7 @@ async def login(payload: LoginRequest):
     """
     query = """
         SELECT u.id, u.tenant_id, u.username, u.email, u.password_hash, u.is_active, 
-               u.first_name, u.last_name, r.name as role_name, t.domain as tenant_domain,
+               u.first_name, u.last_name, COALESCE(u.allowed_modules, '[]'::jsonb) as allowed_modules, r.name as role_name, t.domain as tenant_domain,
                t.sip_domain
         FROM users u
         LEFT JOIN tenants t ON u.tenant_id = t.id
@@ -71,7 +71,8 @@ async def login(payload: LoginRequest):
         "email": user["email"],
         "role": role_name,
         "tenant_id": tenant_id_str,
-        "sip_domain": user.get("sip_domain")
+        "sip_domain": user.get("sip_domain"),
+            "allowed_modules": user.get("allowed_modules") or []
     }
 
     access_token = create_access_token(token_data)
@@ -91,7 +92,8 @@ async def login(payload: LoginRequest):
             "role": role_name,
             "tenant_id": tenant_id_str,
             "tenant_domain": user.get("tenant_domain"),
-            "sip_domain": user.get("sip_domain")
+            "sip_domain": user.get("sip_domain"),
+            "allowed_modules": user.get("allowed_modules") or []
         }
     }
 
@@ -132,7 +134,8 @@ async def refresh_token_endpoint(payload: RefreshTokenRequest):
         "email": user["email"],
         "role": user.get("role_name") or "AGENT",
         "tenant_id": str(user["tenant_id"]) if user["tenant_id"] else None,
-        "sip_domain": user.get("sip_domain")
+        "sip_domain": user.get("sip_domain"),
+            "allowed_modules": user.get("allowed_modules") or []
     }
 
     new_access_token = create_access_token(token_data)
@@ -150,7 +153,7 @@ async def get_me(current_user: CurrentUser = Depends(get_current_user)):
     """
     query = """
         SELECT u.id, u.tenant_id, u.username, u.email, u.first_name, u.last_name, u.is_active,
-               u.created_at, r.name as role_name, t.name as tenant_name, t.domain as tenant_domain,
+               COALESCE(u.allowed_modules, '[]'::jsonb) as allowed_modules, u.created_at, r.name as role_name, t.name as tenant_name, t.domain as tenant_domain,
                t.sip_domain
         FROM users u
         LEFT JOIN tenants t ON u.tenant_id = t.id
@@ -169,11 +172,13 @@ async def get_me(current_user: CurrentUser = Depends(get_current_user)):
         "first_name": user.get("first_name"),
         "last_name": user.get("last_name"),
         "role": user.get("role_name"),
+        "allowed_modules": user.get("allowed_modules") or [],
         "tenant": {
             "id": str(user["tenant_id"]) if user["tenant_id"] else None,
             "name": user.get("tenant_name"),
             "domain": user.get("tenant_domain"),
-            "sip_domain": user.get("sip_domain")
+            "sip_domain": user.get("sip_domain"),
+            "allowed_modules": user.get("allowed_modules") or []
         } if user.get("tenant_id") else None,
         "created_at": user.get("created_at")
     }

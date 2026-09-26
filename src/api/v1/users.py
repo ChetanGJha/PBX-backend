@@ -1,3 +1,4 @@
+import json
 from typing import Optional, List
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -17,7 +18,8 @@ class UserCreate(BaseModel):
     password: str = Field(..., min_length=8)
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    role: str = Field("AGENT", description="Role: TENANT_ADMIN, SUPERVISOR, AGENT")
+    role: str = Field("AGENT", description="Role: TENANT_ADMIN, SUB_ADMIN, SUPERVISOR, AGENT")
+    allowed_modules: Optional[List[str]] = Field(default_factory=list)
 
 
 class UserResponse(BaseModel):
@@ -30,6 +32,7 @@ class UserResponse(BaseModel):
     first_name: Optional[str]
     last_name: Optional[str]
     role: str
+    allowed_modules: Optional[List[str]] = []
     is_active: bool
     created_at: str
 
@@ -56,6 +59,7 @@ async def list_users(
     query = """
         SELECT u.id, u.tenant_id, t.name as tenant_name, t.domain as tenant_domain,
                u.username, u.email, u.first_name, u.last_name, u.is_active,
+               COALESCE(u.allowed_modules, '[]'::jsonb) as allowed_modules,
                COALESCE(r.name, 'AGENT') as role,
                u.created_at::text as created_at
         FROM users u
@@ -126,8 +130,8 @@ async def create_user(
         # Insert user
         user_res = await session.execute(
             text("""
-            INSERT INTO users (tenant_id, username, email, password_hash, first_name, last_name)
-            VALUES (:t_id, :username, :email, :pwd_hash, :fn, :ln)
+            INSERT INTO users (tenant_id, username, email, password_hash, first_name, last_name, allowed_modules)
+            VALUES (:t_id, :username, :email, :pwd_hash, :fn, :ln, CAST(:allowed_modules AS jsonb))
             RETURNING id, created_at::text
             """),
             {
@@ -136,7 +140,8 @@ async def create_user(
                 "email": payload.email,
                 "pwd_hash": pwd_hash,
                 "fn": payload.first_name,
-                "ln": payload.last_name
+                "ln": payload.last_name,
+                "allowed_modules": json.dumps(payload.allowed_modules or [])
             }
         )
         user_row = user_res.fetchone()
@@ -171,6 +176,7 @@ async def create_user(
         "first_name": payload.first_name,
         "last_name": payload.last_name,
         "role": target_role,
+        "allowed_modules": payload.allowed_modules or [],
         "is_active": True,
         "created_at": created_at_str
     }
@@ -199,3 +205,32 @@ async def delete_user(
         {"u_id": user_id}
     )
     return None
+
+
+class UserPermissionsUpdate(BaseModel):
+    allowed_modules: List[str] = Field(default_factory=list)
+
+@router.put("/{user_id}/permissions")
+async def update_user_permissions(
+    user_id: UUID,
+    payload: UserPermissionsUpdate,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Update module permissions for a sub-administrator.
+    """
+    user = await execute_query_one(
+        "SELECT id, tenant_id FROM users WHERE id = :u_id AND deleted_at IS NULL",
+        {"u_id": user_id}
+    )
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    if current_user.role != "SUPER_ADMIN" and user["tenant_id"] != current_user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot edit user from another tenant.")
+
+    await execute_query(
+        "UPDATE users SET allowed_modules = CAST(:modules AS jsonb), updated_at = NOW() WHERE id = :u_id",
+        {"u_id": user_id, "modules": json.dumps(payload.allowed_modules)}
+    )
+    return {"status": "success", "user_id": str(user_id), "allowed_modules": payload.allowed_modules}
