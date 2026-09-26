@@ -197,7 +197,9 @@ async def delete_user(
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
-    if current_user.role != "SUPER_ADMIN" and user["tenant_id"] != current_user.tenant_id:
+    target_tenant_str = str(user["tenant_id"]) if user.get("tenant_id") else None
+    current_tenant_str = str(current_user.tenant_id) if current_user.tenant_id else None
+    if current_user.role != "SUPER_ADMIN" and target_tenant_str != current_tenant_str:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot delete user from another tenant.")
 
     await execute_query(
@@ -220,17 +222,19 @@ async def update_user_permissions(
     Update module permissions for a sub-administrator.
     """
     user = await execute_query_one(
-        "SELECT id, tenant_id FROM users WHERE id = :u_id AND deleted_at IS NULL",
+        "SELECT id, tenant_id FROM users WHERE id = CAST(:u_id AS uuid) AND deleted_at IS NULL",
         {"u_id": user_id}
     )
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
 
-    if current_user.role != "SUPER_ADMIN" and user["tenant_id"] != current_user.tenant_id:
+    target_tenant_str = str(user["tenant_id"]) if user.get("tenant_id") else None
+    current_tenant_str = str(current_user.tenant_id) if current_user.tenant_id else None
+    if current_user.role != "SUPER_ADMIN" and target_tenant_str != current_tenant_str:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot edit user from another tenant.")
 
     await execute_query(
-        "UPDATE users SET allowed_modules = CAST(:modules AS jsonb), updated_at = NOW() WHERE id = :u_id",
+        "UPDATE users SET allowed_modules = CAST(:modules AS jsonb), updated_at = NOW() WHERE id = CAST(:u_id AS uuid)",
         {"u_id": user_id, "modules": json.dumps(payload.allowed_modules)}
     )
     return {"status": "success", "user_id": str(user_id), "allowed_modules": payload.allowed_modules}

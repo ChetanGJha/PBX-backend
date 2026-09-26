@@ -33,14 +33,23 @@ class GatewayAssignmentCreate(BaseModel):
 @router.get("")
 async def list_gateways(current_user: CurrentUser = Depends(get_current_user)):
     query = """
-        SELECT g.id, g.name, g.proxy, g.username, g.realm, g.from_domain, g.codecs,
+        SELECT DISTINCT g.id, g.name, g.proxy, g.username, g.realm, g.from_domain, g.codecs,
                g.register, g.enabled, g.created_at::text, t.name as tenant_name
         FROM gateways g
         LEFT JOIN tenants t ON g.tenant_id = t.id
+        LEFT JOIN tenant_gateways tg ON g.id = tg.gateway_id
         WHERE g.deleted_at IS NULL
-        ORDER BY g.name ASC
     """
-    rows = await execute_query(query)
+    params = {}
+    if not current_user.is_super_admin:
+        if current_user.tenant_id:
+            query += " AND (g.tenant_id = CAST(:t_id AS uuid) OR tg.tenant_id = CAST(:t_id AS uuid))"
+            params["t_id"] = current_user.tenant_id
+        else:
+            return []
+
+    query += " ORDER BY g.name ASC"
+    rows = await execute_query(query, params)
     return [dict(r) for r in rows]
 
 @router.post("", status_code=status.HTTP_201_CREATED)
