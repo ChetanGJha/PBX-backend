@@ -50,7 +50,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from src.api.v1 import auth, tenants, extensions, users
+from src.api.v1 import auth, tenants, extensions, users, trunks, gateways, routing, queues
 from src.xml_curl import router as xml_curl_router
 
 
@@ -60,6 +60,10 @@ app.include_router(auth.router, prefix=settings.API_V1_STR)
 app.include_router(tenants.router, prefix=settings.API_V1_STR)
 app.include_router(extensions.router, prefix=settings.API_V1_STR)
 app.include_router(users.router, prefix=settings.API_V1_STR)
+app.include_router(trunks.router, prefix=settings.API_V1_STR)
+app.include_router(gateways.router, prefix=settings.API_V1_STR)
+app.include_router(routing.router, prefix=settings.API_V1_STR)
+app.include_router(queues.router, prefix=settings.API_V1_STR)
 
 # Include FreeSWITCH mod_xml_curl Router
 app.include_router(xml_curl_router.router)
