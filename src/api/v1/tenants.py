@@ -1,187 +1,100 @@
 from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from uuid import UUID
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+
 from src.core.database import execute_query, execute_query_one
-from src.core.permissions import get_current_user, CurrentUser, require_roles, validate_tenant_access
+from src.core.permissions import get_current_user, require_roles, CurrentUser
 
 router = APIRouter(prefix="/tenants", tags=["Tenants"])
 
-
 class TenantCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
-    domain: str = Field(..., min_length=3, max_length=255, description="Tenant web domain (e.g., tenant-a.pbx.com)")
-    sip_domain: str = Field(..., min_length=3, max_length=255, description="SIP domain (e.g., tenant-a.example.com)")
-    branding: Optional[dict] = Field(default_factory=dict)
-    timezone: Optional[str] = "UTC"
-    max_extensions: Optional[int] = 100
-    max_concurrent_calls: Optional[int] = 20
+    domain: str = Field(..., min_length=3, max_length=100)
+    sip_domain: Optional[str] = None
+    timezone: str = "UTC"
+    max_extensions: int = 100
+    max_concurrent_calls: int = 20
 
+class TenantStatusUpdate(BaseModel):
+    enabled: bool
 
-class TenantUpdate(BaseModel):
-    name: Optional[str] = None
-    branding: Optional[dict] = None
-    timezone: Optional[str] = None
-    enabled: Optional[bool] = None
-    max_extensions: Optional[int] = None
-    max_concurrent_calls: Optional[int] = None
-
+@router.get("")
+async def list_tenants(current_user: CurrentUser = Depends(get_current_user)):
+    query = """
+        SELECT id, name, domain, sip_domain, timezone, enabled,
+               max_extensions, max_concurrent_calls, created_at::text
+        FROM tenants
+        WHERE deleted_at IS NULL
+        ORDER BY name ASC
+    """
+    rows = await execute_query(query)
+    return [dict(r) for r in rows]
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_tenant(
     payload: TenantCreate,
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
 ):
-    """
-    Create a new tenant entity (Super Admin only).
-    """
-    # Check domain uniqueness among active tenants
-    existing_domain = await execute_query_one(
-        "SELECT id FROM tenants WHERE (domain = :domain OR sip_domain = :sip_domain) AND deleted_at IS NULL",
-        {"domain": payload.domain, "sip_domain": payload.sip_domain}
-    )
-    if existing_domain:
+    clean_domain = payload.domain.strip().lower()
+    sip_dom = payload.sip_domain.strip().lower() if payload.sip_domain else clean_domain
+
+    # Recycler soft-deleted
+    await execute_query("DELETE FROM tenants WHERE domain = :domain AND deleted_at IS NOT NULL", {"domain": clean_domain})
+
+    existing = await execute_query_one("SELECT id FROM tenants WHERE domain = :domain AND deleted_at IS NULL", {"domain": clean_domain})
+    if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Tenant domain or SIP domain already registered."
+            detail=f"Tenant domain '{clean_domain}' is already active."
         )
 
-    # Purge any soft-deleted tenant using the same domain to prevent UNIQUE constraint violation
-    await execute_query(
-        "DELETE FROM tenants WHERE (domain = :domain OR sip_domain = :sip_domain) AND deleted_at IS NOT NULL",
-        {"domain": payload.domain, "sip_domain": payload.sip_domain}
-    )
-
-    import json
     query = """
-        INSERT INTO tenants (name, domain, sip_domain, branding, timezone, max_extensions, max_concurrent_calls)
-        VALUES (:name, :domain, :sip_domain, CAST(:branding AS jsonb), :timezone, :max_extensions, :max_concurrent_calls)
-
-        RETURNING id, name, domain, sip_domain, timezone, enabled, max_extensions, max_concurrent_calls, created_at
+        INSERT INTO tenants (name, domain, sip_domain, timezone, max_extensions, max_concurrent_calls)
+        VALUES (:name, :domain, :sip_domain, :timezone, :max_extensions, :max_concurrent_calls)
+        RETURNING id, name, domain, sip_domain, timezone, enabled, max_extensions, max_concurrent_calls, created_at::text
     """
-    row = await execute_query_one(query, {
-        "name": payload.name,
-        "domain": payload.domain,
-        "sip_domain": payload.sip_domain,
-        "branding": json.dumps(payload.branding or {}),
-        "timezone": payload.timezone or "UTC",
-        "max_extensions": payload.max_extensions or 100,
-        "max_concurrent_calls": payload.max_concurrent_calls or 20
-    })
-
+    data = payload.dict()
+    data["domain"] = clean_domain
+    data["sip_domain"] = sip_dom
+    row = await execute_query_one(query, data)
     return dict(row)
 
-
-@router.get("")
-async def list_tenants(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=100),
-    current_user: CurrentUser = Depends(get_current_user)
+@router.put("/{tenant_id}/status")
+async def toggle_tenant_status(
+    tenant_id: UUID,
+    payload: TenantStatusUpdate,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
 ):
-    """
-    List tenants. Super Admin sees all active tenants; Tenant Admin sees their own tenant context.
-    """
-    if current_user.is_super_admin:
-        query = """
-            SELECT id, name, domain, sip_domain, timezone, enabled, max_extensions, 
-                   max_concurrent_calls, created_at
-            FROM tenants
-            WHERE deleted_at IS NULL
-            ORDER BY name ASC
-            OFFSET :skip LIMIT :limit
-        """
-        rows = await execute_query(query, {"skip": skip, "limit": limit})
-    else:
-        if not current_user.tenant_id:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant context found")
-        query = """
-            SELECT id, name, domain, sip_domain, timezone, enabled, max_extensions, 
-                   max_concurrent_calls, created_at
-            FROM tenants
-            WHERE id = CAST(:tenant_id AS uuid) AND deleted_at IS NULL
-        """
-        rows = await execute_query(query, {"tenant_id": current_user.tenant_id})
-
-    return [dict(r) for r in rows]
-
-
-@router.get("/{tenant_id}")
-async def get_tenant(
-    tenant_id: str,
-    current_user: CurrentUser = Depends(get_current_user)
-):
-    """
-    Get detailed tenant information. Enforces multi-tenant authorization boundaries.
-    """
-    validate_tenant_access(current_user, tenant_id)
-
-    query = """
-        SELECT id, name, domain, sip_domain, branding, timezone, enabled, 
-               max_extensions, max_concurrent_calls, created_at, updated_at
-        FROM tenants
-        WHERE id = CAST(:tenant_id AS uuid) AND deleted_at IS NULL
-    """
-    row = await execute_query_one(query, {"tenant_id": tenant_id})
+    query = "UPDATE tenants SET enabled = :enabled, updated_at = NOW() WHERE id = CAST(:id AS uuid) RETURNING id, name, enabled"
+    row = await execute_query_one(query, {"id": tenant_id, "enabled": payload.enabled})
     if not row:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
-
+        raise HTTPException(status_code=404, detail="Tenant not found")
     return dict(row)
-
-
-@router.put("/{tenant_id}")
-async def update_tenant(
-    tenant_id: str,
-    payload: TenantUpdate,
-    current_user: CurrentUser = Depends(get_current_user)
-):
-    """
-    Update tenant settings. Non-superadmins cannot modify system resource limits or toggle status.
-    """
-    validate_tenant_access(current_user, tenant_id)
-
-    if not current_user.is_super_admin and (payload.enabled is not None or payload.max_extensions is not None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only Super Admin can update tenant resource limits or status"
-        )
-
-    import json
-    query = """
-        UPDATE tenants
-        SET name = COALESCE(:name, name),
-            branding = CASE WHEN :branding IS NOT NULL THEN CAST(:branding AS jsonb) ELSE branding END,
-
-            timezone = COALESCE(:timezone, timezone),
-            enabled = COALESCE(:enabled, enabled),
-            max_extensions = COALESCE(:max_extensions, max_extensions),
-            max_concurrent_calls = COALESCE(:max_concurrent_calls, max_concurrent_calls),
-            updated_at = NOW()
-        WHERE id = CAST(:tenant_id AS uuid) AND deleted_at IS NULL
-        RETURNING id, name, domain, sip_domain, branding, timezone, enabled, max_extensions, max_concurrent_calls, updated_at
-    """
-    row = await execute_query_one(query, {
-        "tenant_id": tenant_id,
-        "name": payload.name,
-        "branding": json.dumps(payload.branding) if payload.branding is not None else None,
-        "timezone": payload.timezone,
-        "enabled": payload.enabled,
-        "max_extensions": payload.max_extensions,
-        "max_concurrent_calls": payload.max_concurrent_calls
-    })
-
-    if not row:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
-
-    return dict(row)
-
 
 @router.delete("/{tenant_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_tenant(
-    tenant_id: str,
+    tenant_id: UUID,
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
 ):
-    """
-    Soft delete tenant (Super Admin only).
-    """
-    query = "UPDATE tenants SET deleted_at = NOW(), enabled = false WHERE id = CAST(:tenant_id AS uuid) AND deleted_at IS NULL"
-    row = await execute_query_one(query, {"tenant_id": tenant_id})
+    # Requirement 2 Safeguard: Check allocated gateways, numbers/DIDs, extensions, IVRs
+    ext_count = await execute_query_one("SELECT COUNT(*) as cnt FROM extensions WHERE tenant_id = CAST(:id AS uuid) AND deleted_at IS NULL", {"id": tenant_id})
+    did_count = await execute_query_one("SELECT COUNT(*) as cnt FROM dids WHERE tenant_id = CAST(:id AS uuid) AND deleted_at IS NULL", {"id": tenant_id})
+    gw_count = await execute_query_one("SELECT COUNT(*) as cnt FROM tenant_gateways WHERE tenant_id = CAST(:id AS uuid)", {"id": tenant_id})
+    ivr_count = await execute_query_one("SELECT COUNT(*) as cnt FROM ivr_menus WHERE tenant_id = CAST(:id AS uuid)", {"id": tenant_id})
+
+    allocated = []
+    if ext_count and ext_count["cnt"] > 0: allocated.append(f"{ext_count['cnt']} Extension(s)")
+    if did_count and did_count["cnt"] > 0: allocated.append(f"{did_count['cnt']} DID Number(s)")
+    if gw_count and gw_count["cnt"] > 0: allocated.append(f"{gw_count['cnt']} Gateway/Trunk Assignment(s)")
+    if ivr_count and ivr_count["cnt"] > 0: allocated.append(f"{ivr_count['cnt']} IVR Menu(s)")
+
+    if allocated:
+        details_str = ", ".join(allocated)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot delete tenant because it has allocated resources: {details_str}. Please unassign or delete allocated resources first."
+        )
+
+    await execute_query("UPDATE tenants SET deleted_at = NOW(), enabled = false WHERE id = CAST(:id AS uuid)", {"id": tenant_id})
     return None

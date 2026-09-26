@@ -16,8 +16,6 @@ class QueueCreate(BaseModel):
     wrap_up_time: int = 10
     max_wait_time: int = 300
     agents: Optional[str] = None
-    announce_position: bool = True
-    announce_wait_time: bool = True
     tenant_id: Optional[UUID] = None
 
 @router.get("")
@@ -28,8 +26,7 @@ async def list_queues(
     target_tenant = tenant_id if current_user.is_super_admin else current_user.tenant_id
     query = """
         SELECT q.id, q.name, q.queue_number, q.strategy, q.agent_timeout, q.wrap_up_time,
-               q.max_wait_time, q.agents, q.announce_position, q.announce_wait_time, q.enabled,
-               q.created_at::text, t.name as tenant_name
+               q.max_wait_time, q.agents, q.enabled, q.created_at::text, t.name as tenant_name
         FROM queues q
         LEFT JOIN tenants t ON q.tenant_id = t.id
         WHERE q.deleted_at IS NULL
@@ -50,11 +47,40 @@ async def create_queue(
 ):
     target_tenant = payload.tenant_id if current_user.is_super_admin else current_user.tenant_id
     query = """
-        INSERT INTO queues (name, queue_number, strategy, agent_timeout, wrap_up_time, max_wait_time, agents, announce_position, announce_wait_time, tenant_id)
-        VALUES (:name, :queue_number, :strategy, :agent_timeout, :wrap_up_time, :max_wait_time, :agents, :announce_position, :announce_wait_time, :tenant_id)
+        INSERT INTO queues (name, queue_number, strategy, agent_timeout, wrap_up_time, max_wait_time, agents, tenant_id)
+        VALUES (:name, :queue_number, :strategy, :agent_timeout, :wrap_up_time, :max_wait_time, :agents, CAST(:tenant_id AS uuid))
         RETURNING id, name, queue_number, strategy, agent_timeout, wrap_up_time, max_wait_time, agents, enabled, created_at::text
     """
     data = payload.dict()
     data["tenant_id"] = target_tenant
     row = await execute_query_one(query, data)
     return dict(row)
+
+@router.put("/{queue_id}")
+async def update_queue(
+    queue_id: UUID,
+    payload: QueueCreate,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    query = """
+        UPDATE queues
+        SET name = :name, queue_number = :queue_number, strategy = :strategy,
+            agent_timeout = :agent_timeout, wrap_up_time = :wrap_up_time,
+            max_wait_time = :max_wait_time, agents = :agents, updated_at = NOW()
+        WHERE id = CAST(:id AS uuid)
+        RETURNING id, name, queue_number, strategy, agents
+    """
+    data = payload.dict()
+    data["id"] = queue_id
+    row = await execute_query_one(query, data)
+    if not row:
+        raise HTTPException(status_code=404, detail="Queue not found")
+    return dict(row)
+
+@router.delete("/{queue_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_queue(
+    queue_id: UUID,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    await execute_query("UPDATE queues SET deleted_at = NOW(), enabled = false WHERE id = CAST(:id AS uuid)", {"id": queue_id})
+    return None

@@ -1,6 +1,7 @@
 import logging
 from fastapi import APIRouter, Request, Response
 from src.xml_curl.directory import handle_directory_request
+from src.xml_curl.dialplan import handle_dialplan_request
 
 logger = logging.getLogger("pbx.xml_curl.router")
 
@@ -18,7 +19,6 @@ NOT_FOUND_XML = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 async def handle_xml_curl(request: Request):
     """
     Main HTTP POST handler for FreeSWITCH mod_xml_curl integration.
-    FreeSWITCH sends form-encoded parameter requests for directory, dialplan, configuration, etc.
     """
     try:
         form_data = await request.form()
@@ -33,8 +33,10 @@ async def handle_xml_curl(request: Request):
         if section == "directory":
             xml_response = await handle_directory_request(form_dict)
             return Response(content=xml_response, media_type="text/xml")
-        
-        # Other sections (dialplan, configuration) will return default/not_found until configured dynamically in Phase 3
+        elif section == "dialplan":
+            xml_response = await handle_dialplan_request(form_dict)
+            return Response(content=xml_response, media_type="text/xml")
+
         logger.debug(f"Unhandled mod_xml_curl section: '{section}'")
         return Response(content=NOT_FOUND_XML, media_type="text/xml")
 
