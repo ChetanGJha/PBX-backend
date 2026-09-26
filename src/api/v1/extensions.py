@@ -13,7 +13,7 @@ class ExtensionCreate(BaseModel):
     tenant_id: Optional[str] = Field(None, description="Tenant ID (derived from user context if omitted)")
     extension_number: str = Field(..., min_length=2, max_length=20, example="1001")
     display_name: str = Field(..., min_length=2, max_length=100, example="John Doe")
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     sip_password: str = Field(..., min_length=8, description="SIP authentication password")
     voicemail_pin: Optional[str] = Field("1234", min_length=4, max_length=10)
     caller_id_name: Optional[str] = None
@@ -26,7 +26,7 @@ class ExtensionCreate(BaseModel):
 
 class ExtensionUpdate(BaseModel):
     display_name: Optional[str] = None
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     caller_id_name: Optional[str] = None
     caller_id_number: Optional[str] = None
     outbound_caller_id: Optional[str] = None
@@ -102,7 +102,7 @@ async def create_extension(
         "tenant_id": target_tenant_id,
         "extension_number": payload.extension_number,
         "display_name": payload.display_name,
-        "email": payload.email,
+        "email": payload.email.strip() if payload.email and payload.email.strip() else None,
         "sip_password": payload.sip_password,
         "voicemail_pin": payload.voicemail_pin or "1234",
         "caller_id_name": payload.caller_id_name or payload.display_name,
