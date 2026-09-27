@@ -47,17 +47,46 @@ async def create_did(
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
 ):
     t_id = payload.trunk_id if payload.trunk_id and payload.trunk_id.strip() != "" else None
+    num = payload.did_number.strip()
+    dest = payload.destination.strip() if payload.destination and payload.destination.strip() else ""
+
+    # Check if number already exists
+    existing = await execute_query_one(
+        "SELECT id, deleted_at FROM dids WHERE did_number = :num",
+        {"num": num}
+    )
+    if existing:
+        if existing.get("deleted_at"):
+            query = """
+                UPDATE dids
+                SET deleted_at = NULL, trunk_id = CAST(:trunk_id AS uuid),
+                    destination_type = :destination_type, destination = :destination,
+                    destination_target = :destination_target, tenant_id = NULL, updated_at = NOW()
+                WHERE id = CAST(:id AS uuid)
+                RETURNING id, did_number, trunk_id, destination_type, destination, enabled, created_at::text
+            """
+            row = await execute_query_one(query, {
+                "id": existing["id"],
+                "trunk_id": t_id,
+                "destination_type": payload.destination_type or "extension",
+                "destination": payload.destination,
+                "destination_target": dest
+            })
+            return dict(row)
+        else:
+            raise HTTPException(status_code=400, detail=f"DID {num} already exists in inventory")
 
     query = """
-        INSERT INTO dids (did_number, trunk_id, destination_type, destination)
-        VALUES (:did_number, CAST(:trunk_id AS uuid), :destination_type, :destination)
+        INSERT INTO dids (did_number, trunk_id, destination_type, destination, destination_target)
+        VALUES (:did_number, CAST(:trunk_id AS uuid), :destination_type, :destination, :destination_target)
         RETURNING id, did_number, trunk_id, destination_type, destination, enabled, created_at::text
     """
     row = await execute_query_one(query, {
-        "did_number": payload.did_number,
+        "did_number": num,
         "trunk_id": t_id,
-        "destination_type": payload.destination_type,
-        "destination": payload.destination
+        "destination_type": payload.destination_type or "extension",
+        "destination": payload.destination,
+        "destination_target": dest
     })
     return dict(row)
 
@@ -86,3 +115,12 @@ async def unassign_did(
     query = "UPDATE dids SET tenant_id = NULL, updated_at = NOW() WHERE id = CAST(:id AS uuid) RETURNING id, did_number"
     row = await execute_query_one(query, {"id": did_id})
     return dict(row)
+
+@router.delete("/{did_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_did(
+    did_id: UUID,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
+):
+    query = "UPDATE dids SET deleted_at = NOW() WHERE id = CAST(:id AS uuid)"
+    await execute_query_one(query, {"id": did_id})
+    return None

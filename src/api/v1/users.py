@@ -1,7 +1,7 @@
 import json
 from typing import Optional, List
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, EmailStr, Field
 
 from src.core.database import execute_query, execute_query_one, execute_transaction
@@ -39,14 +39,19 @@ class UserResponse(BaseModel):
 
 @router.get("", response_model=List[UserResponse])
 async def list_users(
-    tenant_id: Optional[UUID] = None,
+    tenant_id: Optional[str] = Query(None, description="Optional tenant UUID"),
     current_user: CurrentUser = Depends(get_current_user)
 ):
     """
     List users. Super Admins can list all or filter by tenant.
     Tenant Admins only see users within their own tenant.
     """
-    target_tenant = tenant_id
+    target_tenant = None
+    if tenant_id and str(tenant_id).lower() not in ("undefined", "null", "", "none"):
+        try:
+            target_tenant = str(UUID(str(tenant_id)))
+        except (ValueError, TypeError):
+            target_tenant = None
 
     if current_user.role != "SUPER_ADMIN":
         target_tenant = current_user.tenant_id

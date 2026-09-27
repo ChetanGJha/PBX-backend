@@ -251,10 +251,10 @@ CREATE TABLE public.conferences (
 
 CREATE TABLE public.dids (
     id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-    tenant_id uuid NOT NULL,
+    tenant_id uuid,
     did_number character varying(50) NOT NULL,
-    destination_type character varying(30) NOT NULL,
-    destination_target character varying(100) NOT NULL,
+    destination_type character varying(30) DEFAULT 'extension'::character varying NOT NULL,
+    destination_target character varying(100) DEFAULT ''::character varying,
     enabled boolean DEFAULT true,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
