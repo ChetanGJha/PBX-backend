@@ -1,4 +1,9 @@
 <profile name="internal">
+  <aliases>
+    <alias name="pbx.aikyamlabs.local"/>
+    <alias name="127.0.0.1"/>
+    <alias name="172.16.0.179"/>
+  </aliases>
   <settings>
     <param name="debug" value="0"/>
     <param name="sip-port" value="5060"/>
@@ -7,15 +12,31 @@
     <param name="rfc2833-pt" value="101"/>
     <param name="sip-ip" value="$${local_ip_v4}"/>
     <param name="rtp-ip" value="$${local_ip_v4}"/>
-    <param name="ext-rtp-ip" value="auto-nat"/>
-    <param name="ext-sip-ip" value="auto-nat"/>
+    <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
+    <param name="ext-sip-ip" value="$${external_sip_ip}"/>
     <param name="user-agent-string" value="MultiTenantPBX-FreeSWITCH"/>
+
+    <!-- Codec Preferences -->
+    <param name="inbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
+    <param name="outbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
+    <param name="inbound-late-negotiation" value="true"/>
+    <param name="inbound-codec-negotiation" value="generous"/>
 
     <!-- Dynamic HTTP Directory lookup via mod_xml_curl -->
     <param name="auth-calls" value="true"/>
     <param name="accept-blind-reg" value="false"/>
     <param name="accept-blind-auth" value="false"/>
     <param name="suppress-cng" value="true"/>
+    <param name="challenge-realm" value="auto_to"/>
+
+    <!-- Advanced NAT and Contact Traversal for Docker & Softphones -->
+    <param name="NDLB-force-rport" value="true"/>
+    <param name="NDLB-broken-auth-hash" value="true"/>
+    <param name="NDLB-received-in-nat-reg-contact" value="true"/>
+    <param name="NDLB-sendrecv-in-nat" value="true"/>
+    <param name="aggressive-nat-detection" value="true"/>
+    <param name="nat-options-ping" value="true"/>
+    <param name="sip-force-contact" value="NDLB-connectile-dysfunction"/>
 
     <!-- WebRTC WSS Configuration -->
     <param name="ws-binding" value=":5066"/>

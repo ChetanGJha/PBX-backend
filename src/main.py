@@ -44,16 +44,14 @@ app = FastAPI(
 # CORS Middleware Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://.*",
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-from src.api.v1 import (
-    auth, tenants, extensions, users, audio, ivr,
-    queues, routing, dids, hunt_groups, reports, gateways, trunks
-)
+from src.api.v1 import auth, tenants, extensions, users
+from src.api.v1 import audio, ivr, routing, queues, gateways, trunks, reports
 from src.xml_curl import router as xml_curl_router
 
 
@@ -64,13 +62,11 @@ app.include_router(extensions.router, prefix=settings.API_V1_STR)
 app.include_router(users.router, prefix=settings.API_V1_STR)
 app.include_router(audio.router, prefix=settings.API_V1_STR)
 app.include_router(ivr.router, prefix=settings.API_V1_STR)
-app.include_router(queues.router, prefix=settings.API_V1_STR)
 app.include_router(routing.router, prefix=settings.API_V1_STR)
-app.include_router(dids.router, prefix=settings.API_V1_STR)
-app.include_router(hunt_groups.router, prefix=settings.API_V1_STR)
-app.include_router(reports.router, prefix=settings.API_V1_STR)
+app.include_router(queues.router, prefix=settings.API_V1_STR)
 app.include_router(gateways.router, prefix=settings.API_V1_STR)
 app.include_router(trunks.router, prefix=settings.API_V1_STR)
+app.include_router(reports.router, prefix=settings.API_V1_STR)
 
 # Include FreeSWITCH mod_xml_curl Router
 app.include_router(xml_curl_router.router)

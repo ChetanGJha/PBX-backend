@@ -10,6 +10,10 @@
     <param name="ext-rtp-ip" value="auto-nat"/>
     <param name="ext-sip-ip" value="auto-nat"/>
     <param name="user-agent-string" value="MultiTenantPBX-External"/>
+    <!-- Codec Preferences -->
+    <param name="inbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
+    <param name="outbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
+    <param name="inbound-late-negotiation" value="true"/>
     <param name="auth-calls" value="false"/>
     <param name="rtp-timeout-sec" value="300"/>
   </settings>

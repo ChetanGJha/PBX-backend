@@ -68,7 +68,16 @@ services:
       dockerfile: Dockerfile.freeswitch
     container_name: pbx_freeswitch
     restart: always
-    network_mode: host
+    ports:
+      - "5060:5060/tcp"
+      - "5060:5060/udp"
+      - "5061:5061/tcp"
+      - "5066:5066/tcp"
+      - "7443:7443/tcp"
+      - "5080:5080/tcp"
+      - "5080:5080/udp"
+      - "8021:8021/tcp"
+      - "16384-16484:16384-16484/udp"
     volumes:
       - ./config/freeswitch:/etc/freeswitch
       - recording_storage:/var/lib/freeswitch/recordings

@@ -1,0 +1,6 @@
+<configuration name="curl.conf" description="CURL Module">
+  <settings>
+    <param name="gateway-url" value="http://api:8000/freeswitch/"/>
+    <param name="gateway-credentials" value="none"/>
+  </settings>
+</configuration>

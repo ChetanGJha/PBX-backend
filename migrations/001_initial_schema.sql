@@ -1923,7 +1923,7 @@ ALTER TABLE ONLY public.voicemail_messages
 -- PostgreSQL database dump complete
 --
 
---\unrestrict zG7yrshb1qpfcNuZMNCchFrKpwtUwZOvJUSMOHayVSB0QXx45ydK8nHg8Je8uuN
+\unrestrict zG7yrshb1qpfcNuZMNCchFrKpwtUwZOvJUSMOHayVSB0QXx45ydK8nHg8Je8uuN
 
 
 
@@ -1931,7 +1931,9 @@ ALTER TABLE ONLY public.voicemail_messages
 -- SEED DATA: CORE ROLES & PERMISSIONS
 -- ============================================================================
 
-INSERT INTO roles (id, name, description) VALUES
+SET search_path = public, pg_catalog;
+
+INSERT INTO public.roles (id, name, description) VALUES
     ('3fb08e00-1d89-4618-a783-c13e5e34d7f9', 'SUPER_ADMIN', 'Platform Super Administrator with complete system access'),
     ('89b9e390-729d-4855-b6e7-9387870d1db4', 'TENANT_ADMIN', 'Tenant Master Administrator with full access to tenant features'),
     ('6c1dfe90-5ec9-4587-997b-30eecaeaec0c', 'SUB_ADMIN', 'Tenant Sub-Administrator with configurable modular permissions'),
@@ -1939,6 +1941,78 @@ INSERT INTO roles (id, name, description) VALUES
     ('1b6dc9d3-247f-4bf3-b3f7-af1acc82d439', 'AGENT', 'Standard Extension / Softphone User with voicemail & forwarding access')
 ON CONFLICT (name) DO UPDATE SET
     description = EXCLUDED.description;
+
+-- ============================================================================
+-- SEED DATA: TENANTS, USERS, EXTENSIONS, TRUNKS, IVR & VOICEMAIL
+-- ============================================================================
+
+-- 1. Tenants
+INSERT INTO public.tenants (id, name, domain, sip_domain, enabled) VALUES
+    ('9c61b161-db6f-4825-b7db-cb76d88155c5', 'aikyamlabs', 'pbx.aikyamlabs.local', 'pbx.aikyamlabs.local', true),
+    ('45a5c3e7-a7a2-4b81-95ea-3ae21d3d7656', 'Acme Corporation', 'acme.pbx.com', 'acme.local', true)
+ON CONFLICT (id) DO UPDATE SET
+    domain = EXCLUDED.domain,
+    sip_domain = EXCLUDED.sip_domain,
+    enabled = EXCLUDED.enabled;
+
+-- 2. Users (Superadmin & Aikyam Admin)
+INSERT INTO public.users (id, tenant_id, username, email, password_hash, first_name, last_name, is_active) VALUES
+    ('0c909c30-0116-45ab-91c7-b16ec662ee4a', NULL, 'superadmin', 'admin@pbx.com', '$2b$12$6eUuzglJ9MP/3ZFdSCYYke9i4CGZ0U02e2dCKlfeoGazMDeqs1C0y', 'Super', 'Admin', true),
+    ('9c262465-b5af-4158-93b8-75e074b30972', '9c61b161-db6f-4825-b7db-cb76d88155c5', 'aikyamadmin', 'chetang.jha@gmail.com', '$2b$12$R8oz.I.umm6nZs8ifGit4.xdcglEhRIKkxwB2xsQrxZm2W3qwwGqC', 'Chetan', 'Jha', true)
+ON CONFLICT (id) DO UPDATE SET
+    email = EXCLUDED.email,
+    is_active = EXCLUDED.is_active;
+
+-- User Roles Mapping
+INSERT INTO public.user_roles (user_id, role_id) VALUES
+    ('0c909c30-0116-45ab-91c7-b16ec662ee4a', '3fb08e00-1d89-4618-a783-c13e5e34d7f9'),
+    ('9c262465-b5af-4158-93b8-75e074b30972', '89b9e390-729d-4855-b6e7-9387870d1db4')
+ON CONFLICT (user_id, role_id) DO NOTHING;
+
+-- 3. Extensions (1001 with password 10011001 for Chetan Jha on pbx.aikyamlabs.local)
+INSERT INTO public.extensions (id, tenant_id, extension_number, display_name, email, sip_password, voicemail_pin, caller_id_name, caller_id_number, no_answer_timeout, enabled, webrtc_enabled) VALUES
+    ('2bdc3019-5370-47cf-8ce9-4c17548c7199', '9c61b161-db6f-4825-b7db-cb76d88155c5', '1001', 'Chetan Jha', 'chetang.jha@gmail.com', '10011001', '1234', 'Chetan Jha', '1001', 20, true, true),
+    ('883d9ff1-ecff-4235-9ffc-fd70f1ab9b7d', '9c61b161-db6f-4825-b7db-cb76d88155c5', '9001', 'Dinesh Patil', 'dinesh@gmail.com', '90019001', '1234', 'Dinesh Patil', '9001', 20, true, true),
+    ('4ba34070-a5ca-40e9-b7ef-1e3838830922', '9c61b161-db6f-4825-b7db-cb76d88155c5', '1002', 'Alice Smith', 'alice@acme.com', 'SIPPassword123!', '1234', 'Alice Smith', '1002', 20, true, true),
+    ('fa10e1dd-0ee4-4569-a2b4-f8f198ce67a8', '9c61b161-db6f-4825-b7db-cb76d88155c5', '1003', 'Alice Smith', 'alice@acme.com', '10031003', '1234', 'Alice Smith', '1003', 20, true, true),
+    ('17d356c0-bb75-4b05-a2ca-d9fe1181eadc', '9c61b161-db6f-4825-b7db-cb76d88155c5', '1004', 'Dinesh', 'dineshpatil2207@gmail.com', '10045678', '1234', 'Dinesh', '1004', 20, true, true),
+    ('2b5be2f8-7aed-4a12-b596-69489c34c06d', '9c61b161-db6f-4825-b7db-cb76d88155c5', '1005', 'OPERATOR', 'alice@acme.com', '10061006', '1006', 'OPERATOR', '1005', 20, true, true),
+    ('6dbe3e1a-ee6a-4aef-a9bd-9d3bd1078a8e', '9c61b161-db6f-4825-b7db-cb76d88155c5', '1009', 'Test Op', 'chetang.jha@gmail.com', '10091009', '1234', 'Test Op', '1009', 20, true, true)
+ON CONFLICT (tenant_id, extension_number) DO UPDATE SET
+    display_name = EXCLUDED.display_name,
+    email = EXCLUDED.email,
+    sip_password = EXCLUDED.sip_password,
+    voicemail_pin = EXCLUDED.voicemail_pin,
+    caller_id_name = EXCLUDED.caller_id_name,
+    caller_id_number = EXCLUDED.caller_id_number,
+    no_answer_timeout = EXCLUDED.no_answer_timeout,
+    enabled = EXCLUDED.enabled;
+
+-- 4. Voicemail Box for Extension 1001
+INSERT INTO public.voicemail_boxes (id, tenant_id, extension_id, mailbox, email_notification, email_address) VALUES
+    ('8b057424-3640-460d-b9ca-df438db43bba', '9c61b161-db6f-4825-b7db-cb76d88155c5', '2bdc3019-5370-47cf-8ce9-4c17548c7199', '1001', true, 'chetang.jha@gmail.com')
+ON CONFLICT (tenant_id, mailbox) DO UPDATE SET
+    email_notification = EXCLUDED.email_notification,
+    email_address = EXCLUDED.email_address;
+
+-- 5. SIP Trunks
+INSERT INTO public.sip_trunks (id, tenant_id, name, host, port, priority, enabled) VALUES
+    ('e0036b4d-04d7-4c6b-85e0-8e664cc2b8fa', '9c61b161-db6f-4825-b7db-cb76d88155c5', 'tata', '1.2.3.4', 5060, 1, true),
+    ('cc8f9e5e-2d80-46cb-b9c5-bef206cd64e9', NULL, 'Twilio Primary Trunk', 'sip.twilio.com', 5060, 1, true),
+    ('039b6b62-0e67-4c0b-a260-c61600ce1950', NULL, 'Telnyx Secondary Trunk', 'sip.telnyx.com', 5060, 2, true)
+ON CONFLICT (id) DO UPDATE SET
+    name = EXCLUDED.name,
+    host = EXCLUDED.host,
+    port = EXCLUDED.port,
+    enabled = EXCLUDED.enabled;
+
+-- 6. IVR Menus
+INSERT INTO public.ivr_menus (id, tenant_id, name, extension_number, timeout, greeting_audio, enabled) VALUES
+    ('46765586-c906-497f-83ba-0d39776cfbe4', '9c61b161-db6f-4825-b7db-cb76d88155c5', 'Test Welcome IVR', '6001', 10, 'welcome_prompt.wav', true)
+ON CONFLICT (id) DO UPDATE SET
+    extension_number = EXCLUDED.extension_number,
+    greeting_audio = EXCLUDED.greeting_audio,
+    enabled = EXCLUDED.enabled;
 
 -- ============================================================================
 -- END OF SCHEMA & INITIAL SEED

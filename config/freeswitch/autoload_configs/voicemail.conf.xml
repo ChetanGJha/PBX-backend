@@ -1,0 +1,31 @@
+<configuration name="voicemail.conf" description="Voicemail Module">
+  <settings>
+    <param name="file-extension" value="wav"/>
+    <param name="record-space" value="wav"/>
+    <param name="max-record-len" value="300"/>
+    <param name="max-retries" value="3"/>
+    <param name="tone-spec" value="%(1000, 0, 640)"/>
+    <param name="digit-timeout" value="10000"/>
+    <param name="max-login-attempts" value="3"/>
+    <param name="record-silence-hits" value="2"/>
+    <param name="record-silence-threshold" value="200"/>
+  </settings>
+  <profiles>
+    <profile name="default">
+      <param name="file-extension" value="wav"/>
+      <param name="record-space" value="wav"/>
+      <param name="max-record-len" value="300"/>
+      <param name="max-retries" value="3"/>
+      <param name="tone-spec" value="%(1000, 0, 640)"/>
+      <param name="digit-timeout" value="10000"/>
+      <param name="max-login-attempts" value="3"/>
+      <param name="record-silence-hits" value="2"/>
+      <param name="record-silence-threshold" value="200"/>
+      <email>
+        <param name="template-file" value="voicemail.tpl"/>
+        <param name="notify-email" value="alice@acme.com"/>
+        <param name="mailfrom" value="voicemail@pbx.aikyamlabs.local"/>
+      </email>
+    </profile>
+  </profiles>
+</configuration>

@@ -1,0 +1,10 @@
+<configuration name="json_cdr.conf" description="JSON CDR Module">
+  <settings>
+    <param name="url" value="http://api:8000/freeswitch/cdr"/>
+    <param name="delay" value="0"/>
+    <param name="retries" value="2"/>
+    <param name="log-b-leg" value="false"/>
+    <param name="prefix-a-leg" value="false"/>
+    <param name="encode" value="true"/>
+  </settings>
+</configuration>
