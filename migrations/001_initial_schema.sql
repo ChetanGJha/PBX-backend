@@ -2017,3 +2017,36 @@ ON CONFLICT (id) DO UPDATE SET
 -- ============================================================================
 -- END OF SCHEMA & INITIAL SEED
 -- ============================================================================
+
+-- ============================================================================
+-- 7. Call Block (Blacklist) & Contacts
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS public.call_block (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+    number character varying(50) NOT NULL,
+    description character varying(255),
+    action character varying(20) DEFAULT 'reject' NOT NULL,
+    enabled boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT call_block_pkey PRIMARY KEY (id),
+    CONSTRAINT call_block_tenant_number_unique UNIQUE (tenant_id, number)
+);
+CREATE INDEX IF NOT EXISTS idx_call_block_lookup ON public.call_block (tenant_id, number);
+
+CREATE TABLE IF NOT EXISTS public.contacts (
+    id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+    tenant_id uuid NOT NULL REFERENCES public.tenants(id) ON DELETE CASCADE,
+    first_name character varying(100) NOT NULL,
+    last_name character varying(100),
+    organization character varying(150),
+    phone_primary character varying(50) NOT NULL,
+    phone_mobile character varying(50),
+    email character varying(255),
+    notes text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT contacts_pkey PRIMARY KEY (id)
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_tenant ON public.contacts (tenant_id);

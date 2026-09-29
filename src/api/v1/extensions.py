@@ -35,6 +35,26 @@ class ExtensionUpdate(BaseModel):
     no_answer_timeout: Optional[int] = None
 
 
+
+class ExtensionVoicemailPayload(BaseModel):
+    mailbox: Optional[str] = None
+    password: Optional[str] = None
+    email_notification: Optional[bool] = None
+    email_attach_file: Optional[bool] = None
+    email_address: Optional[str] = None
+    delete_after_email: Optional[bool] = None
+    greeting_path: Optional[str] = None
+
+class ExtensionForwardingPayload(BaseModel):
+    forward_always_enabled: Optional[bool] = None
+    forward_always_destination: Optional[str] = None
+    forward_busy_enabled: Optional[bool] = None
+    forward_busy_destination: Optional[str] = None
+    forward_no_answer_enabled: Optional[bool] = None
+    forward_no_answer_destination: Optional[str] = None
+    forward_no_answer_timeout: Optional[int] = None
+
+
 class ResetPasswordPayload(BaseModel):
     new_sip_password: Optional[str] = Field(None, min_length=8)
     new_voicemail_pin: Optional[str] = Field(None, min_length=4, max_length=10)
@@ -150,6 +170,63 @@ async def list_extensions(
         """
         rows = await execute_query(query, {"tenant_id": target_tenant_id, "skip": skip, "limit": limit})
 
+    return [dict(r) for r in rows]
+
+
+
+@router.get("/call-forwarding/all")
+async def list_all_call_forwarding(
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    target_tenant = None if current_user.is_super_admin else current_user.tenant_id
+    query = """
+        SELECT e.id as extension_id, e.extension_number, e.display_name, e.tenant_id, t.name as tenant_name,
+               cf.forward_always_enabled, cf.forward_always_destination,
+               cf.forward_busy_enabled, cf.forward_busy_destination,
+               cf.forward_no_answer_enabled, cf.forward_no_answer_destination,
+               COALESCE(cf.forward_no_answer_timeout, e.no_answer_timeout, 20) as forward_no_answer_timeout,
+               cf.updated_at::text
+        FROM extensions e
+        LEFT JOIN call_forwarding cf ON e.id = cf.extension_id
+        LEFT JOIN tenants t ON e.tenant_id = t.id
+        WHERE e.deleted_at IS NULL
+    """
+    params = {}
+    if target_tenant:
+        query += " AND e.tenant_id = :tenant_id"
+        params["tenant_id"] = target_tenant
+    query += " ORDER BY e.extension_number ASC"
+    rows = await execute_query(query, params)
+    return [dict(r) for r in rows]
+
+
+@router.get("/voicemail-boxes/all")
+async def list_all_voicemail_boxes(
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    target_tenant = None if current_user.is_super_admin else current_user.tenant_id
+    query = """
+        SELECT e.id as extension_id, e.extension_number, e.display_name, e.tenant_id, t.name as tenant_name,
+               vb.id as voicemail_box_id,
+               COALESCE(vb.mailbox, e.extension_number) as mailbox,
+               COALESCE(vb.password, e.voicemail_pin, '1234') as password,
+               COALESCE(vb.email_notification, e.voicemail_to_email, true) as email_notification,
+               COALESCE(vb.email_attach_file, true) as email_attach_file,
+               COALESCE(vb.email_address, e.voicemail_email, e.email) as email_address,
+               COALESCE(vb.delete_after_email, false) as delete_after_email,
+               vb.greeting_path,
+               vb.created_at::text
+        FROM extensions e
+        LEFT JOIN voicemail_boxes vb ON e.id = vb.extension_id
+        LEFT JOIN tenants t ON e.tenant_id = t.id
+        WHERE e.deleted_at IS NULL
+    """
+    params = {}
+    if target_tenant:
+        query += " AND e.tenant_id = :tenant_id"
+        params["tenant_id"] = target_tenant
+    query += " ORDER BY e.extension_number ASC"
+    rows = await execute_query(query, params)
     return [dict(r) for r in rows]
 
 
@@ -281,3 +358,157 @@ async def delete_extension(
         {"id": extension_id}
     )
     return None
+
+@router.get("/{extension_id}/forwarding")
+async def get_extension_forwarding(
+    extension_id: str,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    ext = await execute_query_one("SELECT id, tenant_id, extension_number FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=404, detail="Extension not found")
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+    row = await execute_query_one("SELECT * FROM call_forwarding WHERE extension_id = :id", {"id": extension_id})
+    if not row:
+        return {
+            "extension_id": extension_id,
+            "forward_always_enabled": False,
+            "forward_always_destination": None,
+            "forward_busy_enabled": False,
+            "forward_busy_destination": None,
+            "forward_no_answer_enabled": False,
+            "forward_no_answer_destination": None,
+            "forward_no_answer_timeout": 20
+        }
+    return dict(row)
+
+
+@router.put("/{extension_id}/forwarding")
+async def update_extension_forwarding(
+    extension_id: str,
+    payload: ExtensionForwardingPayload,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN", "AGENT"]))
+):
+    ext = await execute_query_one("SELECT id, tenant_id, extension_number FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=404, detail="Extension not found")
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+
+    upsert_sql = """
+        INSERT INTO call_forwarding (
+            extension_id, forward_always_enabled, forward_always_destination,
+            forward_busy_enabled, forward_busy_destination,
+            forward_no_answer_enabled, forward_no_answer_destination,
+            forward_no_answer_timeout, updated_at
+        ) VALUES (
+            :id, :fae, :fad, :fbe, :fbd, :fne, :fnd, :fnt, NOW()
+        )
+        ON CONFLICT (extension_id) DO UPDATE SET
+            forward_always_enabled = COALESCE(EXCLUDED.forward_always_enabled, call_forwarding.forward_always_enabled),
+            forward_always_destination = EXCLUDED.forward_always_destination,
+            forward_busy_enabled = COALESCE(EXCLUDED.forward_busy_enabled, call_forwarding.forward_busy_enabled),
+            forward_busy_destination = EXCLUDED.forward_busy_destination,
+            forward_no_answer_enabled = COALESCE(EXCLUDED.forward_no_answer_enabled, call_forwarding.forward_no_answer_enabled),
+            forward_no_answer_destination = EXCLUDED.forward_no_answer_destination,
+            forward_no_answer_timeout = COALESCE(EXCLUDED.forward_no_answer_timeout, call_forwarding.forward_no_answer_timeout),
+            updated_at = NOW()
+        RETURNING *
+    """
+    row = await execute_query_one(upsert_sql, {
+        "id": extension_id,
+        "fae": payload.forward_always_enabled,
+        "fad": payload.forward_always_destination,
+        "fbe": payload.forward_busy_enabled,
+        "fbd": payload.forward_busy_destination,
+        "fne": payload.forward_no_answer_enabled,
+        "fnd": payload.forward_no_answer_destination,
+        "fnt": payload.forward_no_answer_timeout or 20
+    })
+
+    if payload.forward_always_enabled is not None:
+        await execute_query_one(
+            "UPDATE extensions SET call_forward_enabled = :en, call_forward_destination = :dest WHERE id = :id RETURNING id",
+            {"en": payload.forward_always_enabled, "dest": payload.forward_always_destination, "id": extension_id}
+        )
+
+    return dict(row)
+
+
+@router.get("/{extension_id}/voicemail")
+async def get_extension_voicemail(
+    extension_id: str,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    ext = await execute_query_one("SELECT id, tenant_id, extension_number, voicemail_pin, voicemail_email, voicemail_to_email FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=404, detail="Extension not found")
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+    row = await execute_query_one("SELECT * FROM voicemail_boxes WHERE extension_id = :id", {"id": extension_id})
+    if not row:
+        return {
+            "extension_id": extension_id,
+            "mailbox": ext["extension_number"],
+            "password": ext.get("voicemail_pin") or "1234",
+            "email_notification": ext.get("voicemail_to_email") if ext.get("voicemail_to_email") is not None else True,
+            "email_attach_file": True,
+            "email_address": ext.get("voicemail_email") or "",
+            "delete_after_email": False,
+            "greeting_path": None
+        }
+    return dict(row)
+
+
+@router.put("/{extension_id}/voicemail")
+async def update_extension_voicemail(
+    extension_id: str,
+    payload: ExtensionVoicemailPayload,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN", "AGENT"]))
+):
+    ext = await execute_query_one("SELECT id, tenant_id, extension_number, voicemail_pin, voicemail_email, voicemail_to_email FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=404, detail="Extension not found")
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+
+    mailbox = payload.mailbox or ext["extension_number"]
+    password = payload.password or ext.get("voicemail_pin") or "1234"
+    email_notification = payload.email_notification if payload.email_notification is not None else True
+    email_attach = payload.email_attach_file if payload.email_attach_file is not None else True
+    email_addr = payload.email_address
+    del_after = payload.delete_after_email if payload.delete_after_email is not None else False
+
+    upsert_sql = """
+        INSERT INTO voicemail_boxes (
+            tenant_id, extension_id, mailbox, password,
+            email_notification, email_attach_file, email_address,
+            delete_after_email, greeting_path
+        ) VALUES (
+            :tid, :eid, :mbox, :pwd, :enotif, :eatt, :eaddr, :dae, :greet
+        )
+        ON CONFLICT (tenant_id, mailbox) DO UPDATE SET
+            password = EXCLUDED.password,
+            email_notification = EXCLUDED.email_notification,
+            email_attach_file = EXCLUDED.email_attach_file,
+            email_address = EXCLUDED.email_address,
+            delete_after_email = EXCLUDED.delete_after_email,
+            greeting_path = COALESCE(EXCLUDED.greeting_path, voicemail_boxes.greeting_path)
+        RETURNING *
+    """
+    row = await execute_query_one(upsert_sql, {
+        "tid": ext["tenant_id"],
+        "eid": extension_id,
+        "mbox": mailbox,
+        "pwd": password,
+        "enotif": email_notification,
+        "eatt": email_attach,
+        "eaddr": email_addr,
+        "dae": del_after,
+        "greet": payload.greeting_path
+    })
+
+    # Sync with extensions table
+    await execute_query_one(
+        "UPDATE extensions SET voicemail_pin = :pwd, voicemail_email = :eaddr, voicemail_to_email = :enotif WHERE id = :id RETURNING id",
+        {"pwd": password, "eaddr": email_addr, "enotif": email_notification, "id": extension_id}
+    )
+
+    return dict(row)

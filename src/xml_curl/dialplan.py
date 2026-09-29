@@ -70,9 +70,198 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     section = SubElement(doc, "section", name="dialplan", description="Dynamic Multi-Tenant Dialplan")
     context_elem = SubElement(section, "context", name=context)
 
+    # -------------------------------------------------------------------------
+    # CALL BLOCK (BLACKLIST) CHECK
+    # -------------------------------------------------------------------------
+    if tenant_id and caller_id_number:
+        try:
+            blocked = await execute_query_one(
+                "SELECT action FROM call_block WHERE tenant_id = CAST(:tid AS uuid) AND number = :num AND enabled = true",
+                {"tid": tenant_id, "num": caller_id_number}
+            )
+            if blocked:
+                act = blocked.get("action", "reject")
+                logger.warning(f"Blocked call from blacklisted caller '{caller_id_number}' (action={act})")
+                ext_elem = SubElement(context_elem, "extension", name="blocked_call")
+                cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+                if act == "busy":
+                    SubElement(cond_elem, "action", application="respond", data="486 Busy Here")
+                elif act == "voicemail":
+                    add_voicemail_block(cond_elem, "1001", domain_name, tenant_id)
+                else:
+                    SubElement(cond_elem, "action", application="respond", data="603 Declined")
+                return format_xml(doc)
+        except Exception as e:
+            logger.error(f"Error checking call_block: {e}")
+
     # =========================================================================
     # SCENARIO 1: SPECIAL FEATURE CODES
     # =========================================================================
+    # Direct Pickup: **<ext>
+    if dest_number.startswith("**") and len(dest_number) > 2:
+        target = dest_number[2:]
+        ext_elem = SubElement(context_elem, "extension", name=f"direct_pickup_{target}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="intercept", data=f"user/{target}@{domain_name}")
+        return format_xml(doc)
+
+    # Group Pickup: *8
+    if dest_number == "*8":
+        ext_elem = SubElement(context_elem, "extension", name="group_pickup")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*8$")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="intercept", data=f"all@{domain_name}")
+        return format_xml(doc)
+
+    # Eavesdrop / Spy: *33<ext>
+    if dest_number.startswith("*33") and len(dest_number) > 3:
+        target = dest_number[3:]
+        ext_elem = SubElement(context_elem, "extension", name=f"eavesdrop_{target}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="eavesdrop", data=f"user/{target}@{domain_name}")
+        return format_xml(doc)
+
+    # Whisper: *34<ext>
+    if dest_number.startswith("*34") and len(dest_number) > 3:
+        target = dest_number[3:]
+        ext_elem = SubElement(context_elem, "extension", name=f"whisper_{target}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="set", data="eavesdrop_whisper_aleg=true")
+        SubElement(cond_elem, "action", application="eavesdrop", data=f"user/{target}@{domain_name}")
+        return format_xml(doc)
+
+    # Intercom / Auto-answer page: *80<ext>
+    if dest_number.startswith("*80") and len(dest_number) > 3:
+        target = dest_number[3:]
+        ext_elem = SubElement(context_elem, "extension", name=f"intercom_{target}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="export", data="sip_h_Call-Info=<sip:x>;answer-after=0")
+        SubElement(cond_elem, "action", application="export", data="sip_auto_answer=true")
+        SubElement(cond_elem, "action", application="export", data="sip_h_Alert-Info=Ring Answer")
+        SubElement(cond_elem, "action", application="bridge", data=f"user/{target}@{domain_name}")
+        return format_xml(doc)
+
+    # Valet Call Parking (*5900 park, *5901-*5999 or 5901-5999 retrieve)
+    if dest_number == "*5900":
+        ext_elem = SubElement(context_elem, "extension", name="valet_park")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*5900$")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+        SubElement(cond_elem, "action", application="valet_park", data=f"parklot_{tenant_id} auto in 5901 5999")
+        return format_xml(doc)
+
+    if (dest_number.startswith("*59") or (dest_number.startswith("59") and dest_number.isdigit())) and len(dest_number.replace("*", "")) == 4:
+        slot = dest_number.replace("*", "")
+        ext_elem = SubElement(context_elem, "extension", name=f"valet_unpark_{slot}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="valet_park", data=f"parklot_{tenant_id} out {slot}")
+        return format_xml(doc)
+
+    # Do Not Disturb (*78 enable, *79 disable)
+    if dest_number == "*78":
+        if tenant_id and caller_id_number:
+            await execute_query(
+                '''INSERT INTO dnd_settings (extension_id, enabled, updated_at)
+                   SELECT id, true, NOW() FROM extensions WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :num
+                   ON CONFLICT (extension_id) DO UPDATE SET enabled = true, updated_at = NOW()''',
+                {"tid": tenant_id, "num": caller_id_number}
+            )
+        ext_elem = SubElement(context_elem, "extension", name="dnd_on")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*78$")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+        SubElement(cond_elem, "action", application="playback", data="tone_stream://%(250,50,440);%(250,50,440)")
+        return format_xml(doc)
+
+    if dest_number == "*79":
+        if tenant_id and caller_id_number:
+            await execute_query(
+                '''INSERT INTO dnd_settings (extension_id, enabled, updated_at)
+                   SELECT id, false, NOW() FROM extensions WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :num
+                   ON CONFLICT (extension_id) DO UPDATE SET enabled = false, updated_at = NOW()''',
+                {"tid": tenant_id, "num": caller_id_number}
+            )
+        ext_elem = SubElement(context_elem, "extension", name="dnd_off")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*79$")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+        SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,50,440)")
+        return format_xml(doc)
+
+    # Call Forwarding (*72<dest> enable, *73 disable)
+    if dest_number.startswith("*72") and len(dest_number) > 3:
+        fwd_target = dest_number[3:]
+        if tenant_id and caller_id_number:
+            await execute_query(
+                '''INSERT INTO call_forwarding (extension_id, forward_always_enabled, forward_always_destination, updated_at)
+                   SELECT id, true, :target, NOW() FROM extensions WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :num
+                   ON CONFLICT (extension_id) DO UPDATE SET forward_always_enabled = true, forward_always_destination = :target, updated_at = NOW()''',
+                {"tid": tenant_id, "num": caller_id_number, "target": fwd_target}
+            )
+        ext_elem = SubElement(context_elem, "extension", name="cf_on")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+        SubElement(cond_elem, "action", application="playback", data="tone_stream://%(250,50,440);%(250,50,440)")
+        return format_xml(doc)
+
+    if dest_number == "*73":
+        if tenant_id and caller_id_number:
+            await execute_query(
+                '''INSERT INTO call_forwarding (extension_id, forward_always_enabled, updated_at)
+                   SELECT id, false, NOW() FROM extensions WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :num
+                   ON CONFLICT (extension_id) DO UPDATE SET forward_always_enabled = false, updated_at = NOW()''',
+                {"tid": tenant_id, "num": caller_id_number}
+            )
+        ext_elem = SubElement(context_elem, "extension", name="cf_off")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*73$")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+        SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,50,440)")
+        return format_xml(doc)
+
+    # Voicemail Star-codes (*97 self, *98 any)
+    if dest_number == "*97":
+        ext_elem = SubElement(context_elem, "extension", name="voicemail_self")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*97$")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+        SubElement(cond_elem, "action", application="voicemail", data=f"check default {domain_name} {caller_id_number}")
+        return format_xml(doc)
+
+    if dest_number == "*98":
+        ext_elem = SubElement(context_elem, "extension", name="voicemail_any")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*98$")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+        SubElement(cond_elem, "action", application="voicemail", data=f"check default {domain_name}")
+        return format_xml(doc)
+
+    # Conference Rooms (3000 to 3999)
+    if dest_number.isdigit() and 3000 <= int(dest_number) <= 3999:
+        conf_room = None
+        if tenant_id:
+            conf_room = await execute_query_one(
+                "SELECT id, name, pin, moderator_pin, record_conference, enabled FROM conferences WHERE extension_number = :dest AND (tenant_id = CAST(:tid AS uuid) OR tenant_id IS NULL) AND enabled = true",
+                {"dest": dest_number, "tid": tenant_id}
+            )
+        conf_name = f"conf_{tenant_id}_{dest_number}"
+        ext_elem = SubElement(context_elem, "extension", name=f"conf_{dest_number}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+        if conf_room and conf_room.get("record_conference"):
+            SubElement(cond_elem, "action", application="record_session", data=f"/var/lib/freeswitch/recordings/{tenant_id}/conf_{dest_number}_${{uuid}}.wav")
+        SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
+        return format_xml(doc)
     if dest_number in ("*96", "9196"):
         ext_elem = SubElement(context_elem, "extension", name="echo_test")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^(\*96|9196)$")
@@ -294,7 +483,9 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
             SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
 
-            if dest_type == "extension":
+            if dest_type in ("business_hours", "time_condition"):
+                await evaluate_and_route_business_hours(cond_elem, target, tenant_id, domain_name, context)
+            elif dest_type == "extension":
                 SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/{target}@{domain_name}")
                 add_voicemail_block(cond_elem, target, domain_name, tenant_id)
             elif dest_type == "queue":
@@ -363,6 +554,16 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         rec_path = f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav"
         SubElement(cond_elem, "action", application="set", data=f"recording_file={rec_path}")
         SubElement(cond_elem, "action", application="record_session", data=rec_path)
+
+        # Check Do Not Disturb (DND)
+        dnd_record = await execute_query_one(
+            "SELECT enabled FROM dnd_settings WHERE extension_id = CAST(:ext_id AS uuid)",
+            {"ext_id": str(target_ext["id"])}
+        )
+        if dnd_record and dnd_record.get("enabled"):
+            logger.info(f"Extension {ext_num} has DND enabled, redirecting to voicemail")
+            add_voicemail_block(cond_elem, ext_num, callee_domain, tenant_id)
+            return format_xml(doc)
 
         # Check Call Forwarding
         cf_record = await execute_query_one(
@@ -453,6 +654,107 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
 
     logger.warning(f"No dialplan route matched for dest='{dest_number}' in context='{context}'")
     return NOT_FOUND_XML
+
+
+
+async def evaluate_and_route_business_hours(cond_elem: Element, target: str, tenant_id: str, domain_name: str, context: str):
+    """
+    Evaluates business hours schedule, checks holidays and weekly open/close window,
+    and appends FreeSWITCH routing actions to cond_elem.
+    """
+    import zoneinfo
+    from datetime import datetime, date
+
+    bh_row = None
+    try:
+        bh_row = await execute_query_one(
+            """
+            SELECT id, name, timezone, schedule,
+                   open_destination_type, open_destination_target,
+                   closed_destination_type, closed_destination_target,
+                   holiday_destination_type, holiday_destination_target
+            FROM business_hours
+            WHERE (id::text = :target OR tenant_id = :tenant_id)
+            ORDER BY (id::text = :target) DESC
+            LIMIT 1
+            """,
+            {"target": str(target or ""), "tenant_id": tenant_id}
+        )
+    except Exception as e:
+        logger.error(f"Error querying business_hours: {e}")
+
+    if not bh_row:
+        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/1001" + "@" + f"{domain_name}")
+        add_voicemail_block(cond_elem, "1001", domain_name, tenant_id)
+        return
+
+    tz_str = bh_row.get("timezone") or "UTC"
+    try:
+        tz = zoneinfo.ZoneInfo(tz_str)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("UTC")
+
+    now_tz = datetime.now(tz)
+    today_date = now_tz.date()
+    curr_time_str = now_tz.strftime("%H:%M")
+    day_name = now_tz.strftime("%A").lower()
+
+    holidays = []
+    try:
+        holidays = await execute_query(
+            "SELECT holiday_date FROM holidays WHERE business_hours_id = :bh_id",
+            {"bh_id": bh_row["id"]}
+        )
+    except Exception as e:
+        logger.error(f"Error querying holidays: {e}")
+
+    is_holiday = any(h.get("holiday_date") == today_date for h in holidays)
+
+    if is_holiday:
+        status = "HOLIDAY"
+        dest_type = bh_row.get("holiday_destination_type") or bh_row.get("closed_destination_type") or "voicemail"
+        dest_target = bh_row.get("holiday_destination_target") or bh_row.get("closed_destination_target") or "1001"
+    else:
+        sched = bh_row.get("schedule") or {}
+        if isinstance(sched, str):
+            import json
+            try:
+                sched = json.loads(sched)
+            except Exception:
+                sched = {}
+        day_conf = sched.get(day_name) or {}
+        is_open = False
+        if day_conf.get("enabled"):
+            o = day_conf.get("open", "00:00")
+            c = day_conf.get("close", "23:59")
+            if o <= curr_time_str < c:
+                is_open = True
+
+        if is_open:
+            status = "OPEN"
+            dest_type = bh_row.get("open_destination_type") or "extension"
+            dest_target = bh_row.get("open_destination_target") or "1001"
+        else:
+            status = "CLOSED"
+            dest_type = bh_row.get("closed_destination_type") or "voicemail"
+            dest_target = bh_row.get("closed_destination_target") or "1001"
+
+    SubElement(cond_elem, "action", application="set", data=f"business_hours_status={status}")
+    SubElement(cond_elem, "action", application="set", data=f"business_hours_name={bh_row.get('name')}")
+
+    if dest_type == "extension":
+        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/{dest_target}" + "@" + f"{domain_name}")
+        add_voicemail_block(cond_elem, dest_target, domain_name, tenant_id)
+    elif dest_type == "ivr":
+        SubElement(cond_elem, "action", application="transfer", data=f"{dest_target or '6001'} XML {context}")
+    elif dest_type in ("hunt_group", "queue"):
+        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/1001" + "@" + f"{domain_name},user/1002" + "@" + f"{domain_name}")
+    elif dest_type == "conference":
+        SubElement(cond_elem, "action", application="conference", data=f"{dest_target}" + "@" + f"{domain_name}")
+    elif dest_type == "voicemail":
+        add_voicemail_block(cond_elem, dest_target, domain_name, tenant_id)
+    else:
+        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/{dest_target}" + "@" + f"{domain_name}")
 
 
 def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str):

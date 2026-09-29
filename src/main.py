@@ -51,7 +51,7 @@ app.add_middleware(
 )
 
 from src.api.v1 import auth, tenants, extensions, users
-from src.api.v1 import audio, ivr, routing, queues, gateways, trunks, reports
+from src.api.v1 import audio, ivr, routing, queues, gateways, trunks, reports, conferences, call_block, contacts, business_hours, dids, hunt_groups
 from src.xml_curl import router as xml_curl_router
 
 
@@ -67,6 +67,12 @@ app.include_router(queues.router, prefix=settings.API_V1_STR)
 app.include_router(gateways.router, prefix=settings.API_V1_STR)
 app.include_router(trunks.router, prefix=settings.API_V1_STR)
 app.include_router(reports.router, prefix=settings.API_V1_STR)
+app.include_router(conferences.router, prefix=settings.API_V1_STR)
+app.include_router(call_block.router, prefix=settings.API_V1_STR)
+app.include_router(contacts.router, prefix=settings.API_V1_STR)
+app.include_router(business_hours.router, prefix=settings.API_V1_STR)
+app.include_router(dids.router, prefix=settings.API_V1_STR)
+app.include_router(hunt_groups.router, prefix=settings.API_V1_STR)
 
 # Include FreeSWITCH mod_xml_curl Router
 app.include_router(xml_curl_router.router)
