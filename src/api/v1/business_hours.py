@@ -114,7 +114,14 @@ async def list_business_hours(
 ):
     target_tenant = tenant_id if current_user.is_super_admin else current_user.tenant_id
 
-    query = """
+    if target_tenant:
+        where_clause = "WHERE b.tenant_id = CAST(:tenant_id AS uuid)"
+        params = {"tenant_id": str(target_tenant)}
+    else:
+        where_clause = ""
+        params = {}
+
+    query = f"""
         SELECT b.id, b.tenant_id, b.name, b.timezone, b.schedule,
                b.open_destination_type, b.open_destination_target,
                b.closed_destination_type, b.closed_destination_target,
@@ -123,17 +130,17 @@ async def list_business_hours(
                (SELECT COUNT(*) FROM holidays h WHERE h.business_hours_id = b.id) as holiday_count
         FROM business_hours b
         LEFT JOIN tenants t ON b.tenant_id = t.id
-        WHERE (:tenant_id IS NULL OR b.tenant_id = :tenant_id)
+        {where_clause}
         ORDER BY b.created_at DESC
     """
-    rows = await execute_query(query, {"tenant_id": target_tenant})
+    rows = await execute_query(query, params)
     
     # Enrich with live status
     enriched = []
     for r in rows:
         holidays = await execute_query(
-            "SELECT id, name, holiday_date::text FROM holidays WHERE business_hours_id = :bh_id",
-            {"bh_id": r["id"]}
+            "SELECT id, name, holiday_date::text FROM holidays WHERE business_hours_id = CAST(:bh_id AS uuid)",
+            {"bh_id": str(r["id"])}
         )
         status_info = evaluate_schedule_now(r, holidays)
         r_copy = dict(r)
@@ -149,6 +156,11 @@ async def create_business_hours(
     current_user: CurrentUser = Depends(get_current_user)
 ):
     target_tenant = data.tenant_id if current_user.is_super_admin and data.tenant_id else current_user.tenant_id
+    if not target_tenant and current_user.is_super_admin:
+        default_tenant = await execute_query_one("SELECT id FROM tenants WHERE enabled = true ORDER BY created_at ASC LIMIT 1")
+        if default_tenant:
+            target_tenant = default_tenant["id"]
+
     if not target_tenant:
         raise HTTPException(status_code=400, detail="Tenant ID is required")
 
@@ -159,7 +171,7 @@ async def create_business_hours(
             closed_destination_type, closed_destination_target,
             holiday_destination_type, holiday_destination_target
         ) VALUES (
-            :tenant_id, :name, :timezone, :schedule::jsonb,
+            CAST(:tenant_id AS uuid), :name, :timezone, CAST(:schedule AS jsonb),
             :open_destination_type, :open_destination_target,
             :closed_destination_type, :closed_destination_target,
             :holiday_destination_type, :holiday_destination_target
@@ -170,7 +182,7 @@ async def create_business_hours(
                     created_at::text, updated_at::text
     """
     res = await execute_query_one(insert_q, {
-        "tenant_id": target_tenant,
+        "tenant_id": str(target_tenant),
         "name": data.name,
         "timezone": data.timezone,
         "schedule": json.dumps(data.schedule),
@@ -197,9 +209,9 @@ async def get_business_hours_details(
                b.created_at::text, b.updated_at::text, t.name as tenant_name
         FROM business_hours b
         LEFT JOIN tenants t ON b.tenant_id = t.id
-        WHERE b.id = :bh_id
+        WHERE b.id = CAST(:bh_id AS uuid)
     """
-    row = await execute_query_one(query, {"bh_id": bh_id})
+    row = await execute_query_one(query, {"bh_id": str(bh_id)})
     if not row:
         raise HTTPException(status_code=404, detail="Business hours schedule not found")
 
@@ -207,8 +219,8 @@ async def get_business_hours_details(
         raise HTTPException(status_code=403, detail="Forbidden")
 
     holidays = await execute_query(
-        "SELECT id, name, holiday_date::text, created_at::text FROM holidays WHERE business_hours_id = :bh_id ORDER BY holiday_date ASC",
-        {"bh_id": bh_id}
+        "SELECT id, name, holiday_date::text, created_at::text FROM holidays WHERE business_hours_id = CAST(:bh_id AS uuid) ORDER BY holiday_date ASC",
+        {"bh_id": str(bh_id)}
     )
     status_info = evaluate_schedule_now(row, holidays)
 
@@ -225,8 +237,8 @@ async def update_business_hours(
     current_user: CurrentUser = Depends(get_current_user)
 ):
     existing = await execute_query_one(
-        "SELECT id, tenant_id FROM business_hours WHERE id = :bh_id",
-        {"bh_id": bh_id}
+        "SELECT id, tenant_id FROM business_hours WHERE id = CAST(:bh_id AS uuid)",
+        {"bh_id": str(bh_id)}
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Business hours schedule not found")
@@ -235,7 +247,7 @@ async def update_business_hours(
         raise HTTPException(status_code=403, detail="Forbidden")
 
     updates = []
-    params: Dict[str, Any] = {"bh_id": bh_id}
+    params: Dict[str, Any] = {"bh_id": str(bh_id)}
 
     if data.name is not None:
         updates.append("name = :name")
@@ -244,7 +256,7 @@ async def update_business_hours(
         updates.append("timezone = :timezone")
         params["timezone"] = data.timezone
     if data.schedule is not None:
-        updates.append("schedule = :schedule::jsonb")
+        updates.append("schedule = CAST(:schedule AS jsonb)")
         params["schedule"] = json.dumps(data.schedule)
     if data.open_destination_type is not None:
         updates.append("open_destination_type = :open_destination_type")
@@ -269,7 +281,7 @@ async def update_business_hours(
         return existing
 
     updates.append("updated_at = NOW()")
-    sql = f"UPDATE business_hours SET {', '.join(updates)} WHERE id = :bh_id RETURNING *"
+    sql = f"UPDATE business_hours SET {', '.join(updates)} WHERE id = CAST(:bh_id AS uuid) RETURNING *"
     updated = await execute_query_one(sql, params)
     return updated
 
@@ -280,8 +292,8 @@ async def delete_business_hours(
     current_user: CurrentUser = Depends(get_current_user)
 ):
     existing = await execute_query_one(
-        "SELECT id, tenant_id FROM business_hours WHERE id = :bh_id",
-        {"bh_id": bh_id}
+        "SELECT id, tenant_id FROM business_hours WHERE id = CAST(:bh_id AS uuid)",
+        {"bh_id": str(bh_id)}
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Business hours schedule not found")
@@ -290,8 +302,8 @@ async def delete_business_hours(
         raise HTTPException(status_code=403, detail="Forbidden")
 
     await execute_query_one(
-        "DELETE FROM business_hours WHERE id = :bh_id RETURNING id",
-        {"bh_id": bh_id}
+        "DELETE FROM business_hours WHERE id = CAST(:bh_id AS uuid) RETURNING id",
+        {"bh_id": str(bh_id)}
     )
     return None
 
@@ -302,15 +314,15 @@ async def get_live_status(
     current_user: CurrentUser = Depends(get_current_user)
 ):
     row = await execute_query_one(
-        "SELECT * FROM business_hours WHERE id = :bh_id",
-        {"bh_id": bh_id}
+        "SELECT * FROM business_hours WHERE id = CAST(:bh_id AS uuid)",
+        {"bh_id": str(bh_id)}
     )
     if not row:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
     holidays = await execute_query(
-        "SELECT id, name, holiday_date::text FROM holidays WHERE business_hours_id = :bh_id",
-        {"bh_id": bh_id}
+        "SELECT id, name, holiday_date::text FROM holidays WHERE business_hours_id = CAST(:bh_id AS uuid)",
+        {"bh_id": str(bh_id)}
     )
     return evaluate_schedule_now(row, holidays)
 
@@ -321,8 +333,8 @@ async def list_holidays(
     current_user: CurrentUser = Depends(get_current_user)
 ):
     holidays = await execute_query(
-        "SELECT id, business_hours_id, name, holiday_date::text, created_at::text FROM holidays WHERE business_hours_id = :bh_id ORDER BY holiday_date ASC",
-        {"bh_id": bh_id}
+        "SELECT id, business_hours_id, name, holiday_date::text, created_at::text FROM holidays WHERE business_hours_id = CAST(:bh_id AS uuid) ORDER BY holiday_date ASC",
+        {"bh_id": str(bh_id)}
     )
     return holidays
 
@@ -334,8 +346,8 @@ async def add_holiday(
     current_user: CurrentUser = Depends(get_current_user)
 ):
     bh = await execute_query_one(
-        "SELECT id, tenant_id FROM business_hours WHERE id = :bh_id",
-        {"bh_id": bh_id}
+        "SELECT id, tenant_id FROM business_hours WHERE id = CAST(:bh_id AS uuid)",
+        {"bh_id": str(bh_id)}
     )
     if not bh:
         raise HTTPException(status_code=404, detail="Business hours schedule not found")
@@ -346,11 +358,11 @@ async def add_holiday(
     created = await execute_query_one(
         """
         INSERT INTO holidays (business_hours_id, name, holiday_date)
-        VALUES (:bh_id, :name, :holiday_date)
+        VALUES (CAST(:bh_id AS uuid), :name, :holiday_date)
         RETURNING id, business_hours_id, name, holiday_date::text, created_at::text
         """,
         {
-            "bh_id": bh_id,
+            "bh_id": str(bh_id),
             "name": data.name,
             "holiday_date": data.holiday_date
         }
@@ -369,9 +381,9 @@ async def delete_holiday(
         SELECT h.id, b.tenant_id
         FROM holidays h
         JOIN business_hours b ON h.business_hours_id = b.id
-        WHERE h.id = :holiday_id AND h.business_hours_id = :bh_id
+        WHERE h.id = CAST(:holiday_id AS uuid) AND h.business_hours_id = CAST(:bh_id AS uuid)
         """,
-        {"holiday_id": holiday_id, "bh_id": bh_id}
+        {"holiday_id": str(holiday_id), "bh_id": str(bh_id)}
     )
     if not h:
         raise HTTPException(status_code=404, detail="Holiday entry not found")
@@ -380,7 +392,7 @@ async def delete_holiday(
         raise HTTPException(status_code=403, detail="Forbidden")
 
     await execute_query_one(
-        "DELETE FROM holidays WHERE id = :holiday_id RETURNING id",
-        {"holiday_id": holiday_id}
+        "DELETE FROM holidays WHERE id = CAST(:holiday_id AS uuid) RETURNING id",
+        {"holiday_id": str(holiday_id)}
     )
     return None

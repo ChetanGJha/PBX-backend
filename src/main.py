@@ -132,13 +132,19 @@ async def readiness_check():
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Global exception handler returning clean JSON error responses."""
+    """Global exception handler returning clean JSON error responses with CORS headers."""
     logger.error(f"Unhandled Exception on {request.method} {request.url}: {exc}", exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        },
         content={
-            "detail": "Internal Server Error",
-            "error": str(exc) if settings.DEBUG else "An unexpected error occurred."
+            "detail": f"Internal Server Error: {str(exc)}",
+            "error": str(exc)
         }
     )
 
