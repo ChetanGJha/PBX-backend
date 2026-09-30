@@ -283,23 +283,73 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SubElement(cond_elem, "action", application="transfer", data=f"1001 XML {context}")
         return format_xml(doc)
 
-    # Test DID 3: Route to Hunt Group (TESTGROUP / 8888 / 5553 / +15551003)
-    if dest_number in ("5553", "+15551003", "8888"):
-        ext_elem = SubElement(context_elem, "extension", name="route_hunt_group")
+    # Dynamic Hunt Group Lookup from Database
+    hg_query = """
+        SELECT id, name, extension_number, strategy, members, timeout, tenant_id
+        FROM hunt_groups
+        WHERE extension_number = :dest AND enabled = true AND deleted_at IS NULL
+        LIMIT 1
+    """
+    hunt_group = await execute_query_one(hg_query, {"dest": dest_number})
+
+    # Fallback for default test DIDs if not in database
+    if not hunt_group and dest_number in ("5553", "+15551003", "8888"):
+        hunt_group = {
+            "name": "TESTGROUP",
+            "extension_number": dest_number,
+            "strategy": "simultaneous",
+            "members": "1001, 1002",
+            "timeout": 25,
+            "tenant_id": tenant_id
+        }
+
+    if hunt_group:
+        hg_name = hunt_group["name"]
+        hg_timeout = hunt_group.get("timeout") or 25
+        raw_members = hunt_group.get("members") or ""
+        hg_tenant_id = hunt_group.get("tenant_id") or tenant_id
+        logger.info(f"Routing to Hunt Group '{hg_name}' (ext {dest_number}) with members: {raw_members}")
+
+        # Parse member extensions: strip whitespace and any domain part (e.g. 1001@pbx.aikyamlabs.local -> 1001)
+        member_list = []
+        for m in raw_members.split(","):
+            m = m.strip()
+            if not m:
+                continue
+            if "@" in m:
+                m_user = m.split("@")[0].strip()
+            else:
+                m_user = m
+            if m_user:
+                member_list.append(m_user)
+
+        ext_elem = SubElement(context_elem, "extension", name=f"route_hunt_group_{dest_number}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={hg_tenant_id}")
         SubElement(cond_elem, "action", application="set", data="direction=inbound")
-        SubElement(cond_elem, "action", application="set", data="did=5553")
+        SubElement(cond_elem, "action", application="set", data=f"did={dest_number}")
         SubElement(cond_elem, "action", application="set", data="hangup_after_bridge=true")
         SubElement(cond_elem, "action", application="export", data="hangup_after_bridge=true")
         SubElement(cond_elem, "action", application="set", data=f"continue_on_fail={VOICEMAIL_CONTINUE_ON_FAIL}")
-        SubElement(cond_elem, "action", application="set", data=f"recording_file=/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
-        SubElement(cond_elem, "action", application="record_session", data=f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
+        SubElement(cond_elem, "action", application="set", data=f"recording_file=/var/lib/freeswitch/recordings/{hg_tenant_id}/${{uuid}}.wav")
+        SubElement(cond_elem, "action", application="set", data=f"execute_on_answer=record_session /var/lib/freeswitch/recordings/{hg_tenant_id}/${{uuid}}.wav")
         SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
-        SubElement(cond_elem, "action", application="instant_ringback=true")
-        # Ring hunt group member extensions (simultaneous strategy) with 25s timeout
-        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/1001@{domain_name},user/1002@{domain_name}")
-        add_voicemail_block(cond_elem, "1001", domain_name, tenant_id)
+        SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
+
+        candidate_domains = list(dict.fromkeys(["127.0.0.1", domain_name, "pbx.aikyamlabs.local"]))
+        bridge_endpoints = []
+        for m_ext in member_list:
+            active_dom = check_registered_domain(m_ext, candidate_domains) or domain_name
+            bridge_endpoints.append(f"user/{m_ext}@{active_dom}")
+
+        if bridge_endpoints:
+            # Simultaneous bridge strategy rings all member endpoints together
+            bridge_data = f"[leg_timeout={hg_timeout}]" + ",".join(bridge_endpoints)
+            SubElement(cond_elem, "action", application="bridge", data=bridge_data)
+
+        # Fallback to voicemail on the first member extension if nobody answers
+        fallback_ext = member_list[0] if member_list else "1001"
+        add_voicemail_block(cond_elem, fallback_ext, domain_name, hg_tenant_id)
         return format_xml(doc)
 
     # Check Database DIDs & Call Routes
@@ -387,11 +437,6 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data=f"recording_file={rec_path}")
         SubElement(cond_elem, "action", application="set", data=f"execute_on_answer=record_session {rec_path}")
 
-        # Voicemail failover triggers immediately on busy/reject/timeout
-        SubElement(cond_elem, "action", application="set", data="failure_causes=USER_BUSY,NO_ANSWER,CALL_REJECTED,ORIGINATOR_CANCEL,DESTINATION_OUT_OF_ORDER,NORMAL_TEMPORARY_FAILURE")
-        SubElement(cond_elem, "action", application="set", data=f"transfer_on_fail=voicemail_{ext_num} XML {context}")
-        SubElement(cond_elem, "action", application="set", data="continue_on_fail=true")
-
         # Check Call Forwarding
         cf_record = await execute_query_one(
             """
@@ -404,11 +449,20 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             {"ext_id": str(target_ext["id"])}
         )
 
+        has_fwd_no_answer = bool(cf_record and cf_record.get("forward_no_answer_enabled") and cf_record.get("forward_no_answer_destination"))
+        fwd_no_answer_dest = cf_record.get("forward_no_answer_destination", "").strip() if has_fwd_no_answer else ""
+
+        # Failover target on no-answer or failure: forward target if enabled, else voicemail
+        fail_target = f"fwd_no_answer_{ext_num}" if has_fwd_no_answer else f"voicemail_{ext_num}"
+
+        SubElement(cond_elem, "action", application="set", data="failure_causes=USER_BUSY,NO_ANSWER,CALL_REJECTED,ORIGINATOR_CANCEL,DESTINATION_OUT_OF_ORDER,NORMAL_TEMPORARY_FAILURE")
+        SubElement(cond_elem, "action", application="set", data=f"transfer_on_fail={fail_target} XML {context}")
+        SubElement(cond_elem, "action", application="set", data="continue_on_fail=true")
+
         if cf_record and cf_record.get("forward_always_enabled") and cf_record.get("forward_always_destination"):
-            cf_dest = cf_record["forward_always_destination"]
+            cf_dest = cf_record["forward_always_destination"].strip()
             logger.info(f"Extension {ext_num} has unconditional forward to {cf_dest}")
-            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={timeout}]user/{cf_dest}@{callee_domain}")
-            SubElement(cond_elem, "action", application="transfer", data=f"voicemail_{ext_num} XML {context}")
+            SubElement(cond_elem, "action", application="transfer", data=f"{cf_dest} XML {context}")
         else:
             # Query FreeSWITCH to check if and where the callee extension is actively registered
             candidate_domains = list(dict.fromkeys(["127.0.0.1", callee_domain, "pbx.aikyamlabs.local"]))
@@ -417,10 +471,18 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             if active_domain:
                 logger.info(f"Callee {ext_num} is actively registered on {active_domain}. Bridging...")
                 SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={timeout}]user/{ext_num}@{active_domain}")
-                SubElement(cond_elem, "action", application="transfer", data=f"voicemail_{ext_num} XML {context}")
+                SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
             else:
-                logger.info(f"Callee {ext_num} is offline (unregistered). Routing directly to voicemail.")
-                SubElement(cond_elem, "action", application="transfer", data=f"voicemail_{ext_num} XML {context}")
+                logger.info(f"Callee {ext_num} is offline (unregistered). Routing to failover target: {fail_target}.")
+                SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
+
+        # Declare the forward-on-no-answer extension in context if enabled
+        if has_fwd_no_answer:
+            fwd_ext_elem = SubElement(context_elem, "extension", name=f"fwd_no_answer_{ext_num}")
+            fwd_cond_elem = SubElement(fwd_ext_elem, "condition", field="destination_number", expression=f"^fwd_no_answer_{ext_num}$")
+            SubElement(fwd_cond_elem, "action", application="log", data=f"INFO Forwarding call for ext {ext_num} on no answer to {fwd_no_answer_dest}")
+            SubElement(fwd_cond_elem, "action", application="set", data=f"transfer_on_fail=voicemail_{ext_num} XML {context}")
+            SubElement(fwd_cond_elem, "action", application="transfer", data=f"{fwd_no_answer_dest} XML {context}")
 
         # Also declare the voicemail extension in the same context for instantaneous in-memory transfer
         vm_ext_elem = SubElement(context_elem, "extension", name=f"voicemail_{ext_num}")
@@ -445,12 +507,12 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         # Strip dialing prefix 9 if present
         dialed_digits = dest_number[1:] if dest_number.startswith("9") else dest_number
 
-        # Check for assigned trunk in database
+        # Check for assigned dedicated trunk or global shared trunk in database
         trunk = await execute_query_one(
             """
             SELECT name, host, port FROM sip_trunks
             WHERE (tenant_id = CAST(:tid AS uuid) OR tenant_id IS NULL) AND enabled = true AND deleted_at IS NULL
-            ORDER BY priority ASC LIMIT 1
+            ORDER BY (tenant_id IS NOT NULL) DESC, priority ASC LIMIT 1
             """,
             {"tid": tenant_id}
         )

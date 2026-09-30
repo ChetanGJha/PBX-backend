@@ -359,6 +359,30 @@ async def delete_extension(
     )
     return None
 
+@router.delete("/{extension_id}/voicemail", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_voicemail_box(
+    extension_id: str,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Delete voicemail box configuration for an extension.
+    """
+    ext = await execute_query_one("SELECT tenant_id FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Extension not found")
+
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+
+    await execute_query_one(
+        "DELETE FROM voicemail_boxes WHERE extension_id = CAST(:id AS uuid) RETURNING id",
+        {"id": extension_id}
+    )
+    await execute_query_one(
+        "UPDATE extensions SET voicemail_pin = NULL, voicemail_email = NULL WHERE id = CAST(:id AS uuid) RETURNING id",
+        {"id": extension_id}
+    )
+    return None
+
 @router.get("/{extension_id}/forwarding")
 async def get_extension_forwarding(
     extension_id: str,

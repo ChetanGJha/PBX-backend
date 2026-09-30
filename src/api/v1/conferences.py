@@ -1,4 +1,4 @@
-﻿from typing import Optional, List
+from typing import Optional, List
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -50,8 +50,8 @@ async def list_conferences(
     """
     params = {}
     if target_tenant:
-        query += " WHERE c.tenant_id = :tenant_id"
-        params["tenant_id"] = target_tenant
+        query += " WHERE c.tenant_id = CAST(:tenant_id AS uuid)"
+        params["tenant_id"] = str(target_tenant)
     query += " ORDER BY c.extension_number ASC"
     rows = await execute_query(query, params)
     return [dict(r) for r in rows]
@@ -62,13 +62,18 @@ async def create_conference(
     payload: ConferenceCreate,
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
 ):
-    tid = payload.tenant_id if current_user.is_super_admin else current_user.tenant_id
-    if not tid and not current_user.is_super_admin:
-        raise HTTPException(status_code=400, detail="tenant_id is required")
+    tid = payload.tenant_id if current_user.is_super_admin and payload.tenant_id else current_user.tenant_id
+    if not tid:
+        # fallback to first active tenant if superadmin
+        first_t = await execute_query_one("SELECT id FROM tenants WHERE deleted_at IS NULL ORDER BY created_at ASC LIMIT 1")
+        if first_t:
+            tid = first_t["id"]
+        else:
+            raise HTTPException(status_code=400, detail="tenant_id is required")
 
     existing = await execute_query_one(
-        "SELECT id FROM conferences WHERE tenant_id = :tid AND extension_number = :ext",
-        {"tid": tid, "ext": payload.extension_number}
+        "SELECT id FROM conferences WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :ext",
+        {"tid": str(tid), "ext": payload.extension_number}
     )
     if existing:
         raise HTTPException(status_code=400, detail="Conference room extension already exists for this tenant")
@@ -76,13 +81,13 @@ async def create_conference(
     query = """
         INSERT INTO conferences (tenant_id, name, extension_number, pin, moderator_pin,
                                 max_members, record_conference, wait_for_moderator, announce_join_leave, enabled)
-        VALUES (:tenant_id, :name, :extension_number, :pin, :moderator_pin,
+        VALUES (CAST(:tenant_id AS uuid), :name, :extension_number, :pin, :moderator_pin,
                 :max_members, :record_conference, :wait_for_moderator, :announce_join_leave, :enabled)
         RETURNING id, tenant_id, name, extension_number, pin, moderator_pin, max_members,
                   record_conference, wait_for_moderator, announce_join_leave, enabled, created_at::text
     """
     data = payload.dict()
-    data["tenant_id"] = tid
+    data["tenant_id"] = str(tid)
     row = await execute_query_one(query, data)
     return dict(row)
 
@@ -94,8 +99,8 @@ async def update_conference(
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
 ):
     existing = await execute_query_one(
-        "SELECT id, tenant_id FROM conferences WHERE id = :id",
-        {"id": conf_id}
+        "SELECT id, tenant_id FROM conferences WHERE id = CAST(:id AS uuid)",
+        {"id": str(conf_id)}
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Conference not found")
@@ -107,15 +112,16 @@ async def update_conference(
         raise HTTPException(status_code=400, detail="No fields to update")
 
     fields = [f"{k} = :{k}" for k in data.keys()]
-    data["id"] = conf_id
+    params = {k: v for k, v in data.items()}
+    params["id"] = str(conf_id)
     query = f"""
         UPDATE conferences
         SET {', '.join(fields)}
-        WHERE id = :id
+        WHERE id = CAST(:id AS uuid)
         RETURNING id, tenant_id, name, extension_number, pin, moderator_pin, max_members,
                   record_conference, wait_for_moderator, announce_join_leave, enabled, created_at::text
     """
-    row = await execute_query_one(query, data)
+    row = await execute_query_one(query, params)
     return dict(row)
 
 
@@ -125,13 +131,13 @@ async def delete_conference(
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
 ):
     existing = await execute_query_one(
-        "SELECT id, tenant_id FROM conferences WHERE id = :id",
-        {"id": conf_id}
+        "SELECT id, tenant_id FROM conferences WHERE id = CAST(:id AS uuid)",
+        {"id": str(conf_id)}
     )
     if not existing:
         raise HTTPException(status_code=404, detail="Conference not found")
     if not current_user.is_super_admin and str(existing["tenant_id"]) != str(current_user.tenant_id):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    await execute_query("DELETE FROM conferences WHERE id = :id", {"id": conf_id})
+    await execute_query("DELETE FROM conferences WHERE id = CAST(:id AS uuid)", {"id": str(conf_id)})
     return None

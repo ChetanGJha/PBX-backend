@@ -21,6 +21,18 @@ class RouteCreate(BaseModel):
     tenant_id: Optional[UUID] = None
 
 
+class RouteUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=2, max_length=100)
+    did_number: Optional[str] = None
+    route_type: Optional[str] = None
+    destination_type: Optional[str] = None
+    destination: Optional[str] = None
+    priority: Optional[int] = None
+    regex_pattern: Optional[str] = None
+    gateway_id: Optional[UUID] = None
+    enabled: Optional[bool] = None
+
+
 @router.get("")
 async def list_routes(
     tenant_id: Optional[UUID] = None,
@@ -34,7 +46,7 @@ async def list_routes(
     query = """
         SELECT r.id, r.name, r.did_number, r.route_type, r.destination_type,
                r.destination, r.priority, r.regex_pattern, r.enabled, r.created_at::text,
-               t.name as tenant_name
+               r.gateway_id, t.name as tenant_name
         FROM call_routes r
         LEFT JOIN tenants t ON r.tenant_id = t.id
         WHERE r.deleted_at IS NULL
@@ -69,3 +81,64 @@ async def create_route(
     data["tenant_id"] = target_tenant
     row = await execute_query_one(query, data)
     return dict(row)
+
+
+@router.put("/{route_id}")
+async def update_route(
+    route_id: UUID,
+    payload: RouteUpdate,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Update an existing call routing rule.
+    """
+    check_query = "SELECT id, tenant_id FROM call_routes WHERE id = CAST(:id AS uuid) AND deleted_at IS NULL"
+    existing = await execute_query_one(check_query, {"id": str(route_id)})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    if not current_user.is_super_admin and str(existing["tenant_id"]) != str(current_user.tenant_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    data = {k: v for k, v in payload.dict(exclude_unset=True).items() if v is not None}
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    set_clauses = []
+    params = {"id": str(route_id)}
+    for k, v in data.items():
+        set_clauses.append(f"{k} = :{k}")
+        params[k] = str(v) if isinstance(v, UUID) else v
+
+    query = f"""
+        UPDATE call_routes
+        SET {", ".join(set_clauses)}
+        WHERE id = CAST(:id AS uuid)
+        RETURNING id, name, did_number, route_type, destination_type, destination, priority, regex_pattern, enabled, created_at::text
+    """
+    row = await execute_query_one(query, params)
+    return dict(row)
+
+
+@router.delete("/{route_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_route(
+    route_id: UUID,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Soft-delete a routing rule.
+    """
+    check_query = "SELECT id, tenant_id FROM call_routes WHERE id = CAST(:id AS uuid) AND deleted_at IS NULL"
+    existing = await execute_query_one(check_query, {"id": str(route_id)})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Route not found")
+
+    if not current_user.is_super_admin and str(existing["tenant_id"]) != str(current_user.tenant_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    await execute_query_one(
+        "UPDATE call_routes SET deleted_at = NOW() WHERE id = CAST(:id AS uuid) RETURNING id",
+        {"id": str(route_id)}
+    )
+    return None
+

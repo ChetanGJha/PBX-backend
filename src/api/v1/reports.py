@@ -1,7 +1,9 @@
+import os
 import logging
 from typing import Optional, List
 from uuid import UUID
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi.responses import FileResponse
 from src.core.database import execute_query, execute_query_one
 from src.core.permissions import get_current_user, require_roles, CurrentUser
 
@@ -24,12 +26,26 @@ async def get_cdr_report(
     target_tenant = tenant_id if current_user.is_super_admin else current_user.tenant_id
 
     query = """
-        SELECT c.id, c.call_uuid, c.caller_number, c.caller_name, c.destination as destination_number,
-               c.source_extension, c.destination_extension,
-               c.start_time::text as start_stamp, c.answer_time::text as answer_stamp, c.end_time::text as end_stamp,
-               c.duration, c.billsec, c.hangup_cause, c.direction, c.recording_id,
-               r.file_path as recording_file_path, r.file_size as recording_file_size,
-               t.name as tenant_name, t.domain as tenant_domain
+        SELECT c.id, c.call_uuid,
+               COALESCE(c.caller_number, c.source_extension, 'Unknown') as caller_id_number,
+               COALESCE(c.caller_name, 'N/A') as caller_id_name,
+               COALESCE(c.destination, c.destination_extension, 'Unknown') as destination_number,
+               COALESCE(c.source_extension, c.caller_number, 'Unknown') as source_extension,
+               COALESCE(c.destination_extension, c.destination, 'Unknown') as destination_extension,
+               c.start_time::text as start_stamp, 
+               c.start_time::text as start_time,
+               c.created_at::text as created_at,
+               c.answer_time::text as answer_stamp, 
+               c.end_time::text as end_stamp,
+               COALESCE(c.duration, 0) as duration, 
+               COALESCE(c.billsec, 0) as billsec, 
+               COALESCE(c.hangup_cause, 'NORMAL_CLEARING') as hangup_cause, 
+               COALESCE(c.direction, 'internal') as direction, 
+               c.recording_id,
+               r.file_path as recording_file_path, 
+               r.file_size as recording_file_size,
+               COALESCE(t.name, 'Global') as tenant_name, 
+               t.domain as tenant_domain
         FROM cdr c
         LEFT JOIN tenants t ON c.tenant_id = t.id
         LEFT JOIN recordings r ON c.recording_id = r.id
@@ -66,12 +82,21 @@ async def list_call_recordings(
     """
     List recorded call sessions.
     """
-    target_tenant = tenant_id if current_user.is_super_admin else current_user.tenant_id
+    target_tenant = tenant_id if current_user.is_super_admin and tenant_id else current_user.tenant_id
 
     query = """
-        SELECT r.id, r.call_uuid, r.source_extension, r.caller_number, r.destination_number,
-               r.direction, r.start_time::text, r.duration, r.file_path, r.file_size,
-               t.name as tenant_name
+        SELECT r.id, r.call_uuid, 
+               COALESCE(r.source_extension, r.caller_number, 'Unknown') as source_extension,
+               COALESCE(r.caller_number, r.source_extension, 'Unknown') as caller_number,
+               COALESCE(r.destination_number, 'Unknown') as destination_number,
+               COALESCE(r.direction, 'call') as direction,
+               r.start_time::text as start_time,
+               COALESCE(r.created_at, r.start_time)::text as created_at,
+               COALESCE(r.duration, 0) as duration, 
+               r.file_path,
+               COALESCE(substring(r.file_path from '[^/\\\\]+$'), 'recording.wav') as file_name,
+               COALESCE(r.file_size, 0) as file_size,
+               COALESCE(t.name, 'Global') as tenant_name
         FROM recordings r
         LEFT JOIN tenants t ON r.tenant_id = t.id
         WHERE 1=1
@@ -82,6 +107,147 @@ async def list_call_recordings(
         params["t_id"] = str(target_tenant)
 
     query += " ORDER BY r.start_time DESC LIMIT 500"
+    rows = await execute_query(query, params)
+    return [dict(r) for r in rows]
+
+
+@router.get("/recordings/{recording_id}/stream")
+async def stream_call_recording(
+    recording_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Stream call recording audio file.
+    """
+    row = await execute_query_one(
+        "SELECT file_path, tenant_id FROM recordings WHERE id = CAST(:id AS uuid)",
+        {"id": str(recording_id)}
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Recording not found")
+
+    if not current_user.is_super_admin and row["tenant_id"] != current_user.tenant_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    file_path = row.get("file_path")
+    resolved_path = None
+    if file_path and os.path.exists(file_path):
+        resolved_path = file_path
+    else:
+        # Fallback candidates inside docker volume
+        base_name = os.path.basename(file_path) if file_path else f"{recording_id}.wav"
+        candidates = [
+            f"/var/lib/freeswitch/recordings/{row['tenant_id']}/{base_name}",
+            f"/var/lib/freeswitch/recordings/{base_name}",
+            f"/var/lib/freeswitch/recordings/archive/{base_name}",
+        ]
+        for cand in candidates:
+            if os.path.exists(cand):
+                resolved_path = cand
+                break
+
+    if not resolved_path:
+        raise HTTPException(status_code=404, detail="Recording audio file not found on disk")
+
+    return FileResponse(
+        resolved_path,
+        media_type="audio/wav",
+        filename=os.path.basename(resolved_path),
+        headers={"Accept-Ranges": "bytes"}
+    )
+
+
+@router.get("/outbound")
+async def get_outbound_report(
+    tenant_id: Optional[UUID] = None,
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Outbound calls analytics.
+    """
+    target_tenant = tenant_id if current_user.is_super_admin and tenant_id else current_user.tenant_id
+    query = """
+        SELECT c.id, c.call_uuid,
+               COALESCE(c.source_extension, c.caller_number, 'Unknown') as caller_id_number,
+               COALESCE(c.source_extension, c.caller_number, 'Unknown') as source_extension,
+               COALESCE(c.destination, c.destination_extension, 'Unknown') as destination_number,
+               COALESCE(c.destination, c.destination_extension, 'Unknown') as destination,
+               c.start_time::text as start_stamp,
+               c.start_time::text as start_time,
+               COALESCE(c.created_at, c.start_time)::text as created_at,
+               COALESCE(c.duration, 0) as duration,
+               COALESCE(c.billsec, 0) as billsec,
+               COALESCE(c.hangup_cause, 'NORMAL_CLEARING') as hangup_cause,
+               COALESCE(t.name, 'Global') as tenant_name
+        FROM cdr c
+        LEFT JOIN tenants t ON c.tenant_id = t.id
+        WHERE (c.direction = 'outbound' OR c.direction = 'Outbound' OR LENGTH(c.destination) > 6)
+    """
+    params = {}
+    if target_tenant:
+        query += " AND c.tenant_id = CAST(:t_id AS uuid)"
+        params["t_id"] = str(target_tenant)
+    if start_date:
+        query += " AND c.start_time >= CAST(:start_date AS timestamptz)"
+        params["start_date"] = f"{start_date} 00:00:00"
+    if end_date:
+        query += " AND c.start_time <= CAST(:end_date AS timestamptz)"
+        params["end_date"] = f"{end_date} 23:59:59"
+
+    query += " ORDER BY c.start_time DESC LIMIT 500"
+    rows = await execute_query(query, params)
+    return [dict(r) for r in rows]
+
+
+@router.get("/internal")
+async def get_internal_summary(
+    tenant_id: Optional[UUID] = None,
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Extension-to-extension internal calls summary.
+    Excludes non-extension numbers, feature codes (*xx), and automated prefixes.
+    """
+    target_tenant = tenant_id if current_user.is_super_admin and tenant_id else current_user.tenant_id
+    query = """
+        SELECT 
+            COALESCE(c.source_extension, c.caller_number, 'Unknown') as caller_id_number,
+            COALESCE(c.destination_extension, c.destination, 'Unknown') as destination_number,
+            COUNT(*) as total_calls,
+            COALESCE(SUM(c.duration), 0) as total_duration_sec,
+            ROUND(COALESCE(AVG(c.duration), 0)) as avg_duration_sec
+        FROM cdr c
+        WHERE c.direction = 'internal'
+          AND c.destination NOT LIKE '*%'
+          AND c.destination NOT LIKE 'fwd_%'
+          AND c.destination NOT LIKE 'voicemail_%'
+          AND LENGTH(COALESCE(c.destination_extension, c.destination, '')) <= 6
+          AND LENGTH(COALESCE(c.source_extension, c.caller_number, '')) <= 6
+          AND COALESCE(c.source_extension, c.caller_number, '') ~ '^[0-9]+$'
+          AND COALESCE(c.destination_extension, c.destination, '') ~ '^[0-9]+$'
+          AND COALESCE(c.source_extension, c.caller_number, '') != COALESCE(c.destination_extension, c.destination, '')
+    """
+    params = {}
+    if target_tenant:
+        query += " AND c.tenant_id = CAST(:t_id AS uuid)"
+        params["t_id"] = str(target_tenant)
+    if start_date:
+        query += " AND c.start_time >= CAST(:start_date AS timestamptz)"
+        params["start_date"] = f"{start_date} 00:00:00"
+    if end_date:
+        query += " AND c.start_time <= CAST(:end_date AS timestamptz)"
+        params["end_date"] = f"{end_date} 23:59:59"
+
+    query += """
+        GROUP BY COALESCE(c.source_extension, c.caller_number, 'Unknown'),
+                 COALESCE(c.destination_extension, c.destination, 'Unknown')
+        ORDER BY total_calls DESC
+        LIMIT 500
+    """
     rows = await execute_query(query, params)
     return [dict(r) for r in rows]
 
@@ -234,13 +400,11 @@ async def delete_voicemail(
     """
     Delete a voicemail message and clean up audio file.
     """
-    import os
     row = await execute_query_one(
         "SELECT file_path FROM voicemail_messages WHERE id = CAST(:id AS uuid)",
         {"id": str(message_id)}
     )
     if not row:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Voicemail message not found")
 
     file_path = row.get("file_path")
@@ -265,10 +429,6 @@ async def stream_voicemail_audio(
     """
     Stream audio file for a voicemail message.
     """
-    import os
-    from fastapi.responses import FileResponse
-    from fastapi import HTTPException
-
     row = await execute_query_one(
         "SELECT file_path FROM voicemail_messages WHERE id = CAST(:id AS uuid)",
         {"id": str(message_id)}
@@ -286,4 +446,3 @@ async def stream_voicemail_audio(
         filename=os.path.basename(file_path),
         headers={"Accept-Ranges": "bytes"}
     )
-

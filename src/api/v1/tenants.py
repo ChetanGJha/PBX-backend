@@ -19,6 +19,8 @@ class TenantCreate(BaseModel):
 
 class TenantUpdate(BaseModel):
     name: Optional[str] = None
+    domain: Optional[str] = None
+    sip_domain: Optional[str] = None
     branding: Optional[dict] = None
     timezone: Optional[str] = None
     enabled: Optional[bool] = None
@@ -148,8 +150,9 @@ async def update_tenant(
     query = """
         UPDATE tenants
         SET name = COALESCE(:name, name),
+            domain = COALESCE(:domain, domain),
+            sip_domain = COALESCE(:sip_domain, sip_domain),
             branding = CASE WHEN :branding IS NOT NULL THEN CAST(:branding AS jsonb) ELSE branding END,
-
             timezone = COALESCE(:timezone, timezone),
             enabled = COALESCE(:enabled, enabled),
             max_extensions = COALESCE(:max_extensions, max_extensions),
@@ -161,6 +164,8 @@ async def update_tenant(
     row = await execute_query_one(query, {
         "tenant_id": tenant_id,
         "name": payload.name,
+        "domain": payload.domain,
+        "sip_domain": payload.sip_domain,
         "branding": json.dumps(payload.branding) if payload.branding is not None else None,
         "timezone": payload.timezone,
         "enabled": payload.enabled,
