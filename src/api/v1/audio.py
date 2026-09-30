@@ -18,7 +18,7 @@ logger = logging.getLogger("pbx.audio")
 router = APIRouter(prefix="/audio", tags=["Audio Files"])
 
 # Directory inside the container where audio files are stored
-AUDIO_DIR = "/app/media/audio"
+AUDIO_DIR = "/var/lib/freeswitch/recordings/audio"
 
 
 def _ensure_audio_dir():
@@ -218,7 +218,11 @@ async def stream_audio_file(file_id: str):
         if os.path.exists(alt_path):
             file_path = alt_path
         else:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from server disk")
+            prompt_fb = "/var/lib/freeswitch/recordings/prompts/voicemail_greeting.wav"
+            if os.path.exists(prompt_fb):
+                file_path = prompt_fb
+            else:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Audio file missing from server disk")
 
     ext = os.path.splitext(file_path)[1].lower()
     media_type = "audio/mpeg" if ext == ".mp3" else ("audio/wav" if ext == ".wav" else "audio/ogg")

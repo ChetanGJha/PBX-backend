@@ -63,14 +63,17 @@ async def handle_directory_request(form_data: Dict[str, Any]) -> str:
     tenant_id = str(tenant["id"])
     sip_domain = tenant["sip_domain"]
 
-    # 2. Fetch extension(s)
+    # 2. Fetch extension(s) with voicemail configuration
     if user_id:
         extensions = await execute_query(
             """
-            SELECT extension_number, display_name, email, sip_password, voicemail_pin,
-                   caller_id_name, caller_id_number, outbound_caller_id, enabled
-            FROM extensions
-            WHERE tenant_id = :tenant_id AND extension_number = :user_id AND enabled = true AND deleted_at IS NULL
+            SELECT e.extension_number, e.display_name, e.email, e.sip_password, e.voicemail_pin,
+                   e.caller_id_name, e.caller_id_number, e.outbound_caller_id, e.enabled,
+                   vb.password as vb_password, vb.email_notification, vb.email_attach_file,
+                   vb.email_address as vb_email, vb.delete_after_email
+            FROM extensions e
+            LEFT JOIN voicemail_boxes vb ON e.id = vb.extension_id AND vb.tenant_id = e.tenant_id
+            WHERE e.tenant_id = :tenant_id AND e.extension_number = :user_id AND e.enabled = true AND e.deleted_at IS NULL
             """,
             {"tenant_id": tenant_id, "user_id": user_id}
         )
@@ -78,10 +81,13 @@ async def handle_directory_request(form_data: Dict[str, Any]) -> str:
         # Fetch all active extensions for this domain
         extensions = await execute_query(
             """
-            SELECT extension_number, display_name, email, sip_password, voicemail_pin,
-                   caller_id_name, caller_id_number, outbound_caller_id, enabled
-            FROM extensions
-            WHERE tenant_id = :tenant_id AND enabled = true AND deleted_at IS NULL
+            SELECT e.extension_number, e.display_name, e.email, e.sip_password, e.voicemail_pin,
+                   e.caller_id_name, e.caller_id_number, e.outbound_caller_id, e.enabled,
+                   vb.password as vb_password, vb.email_notification, vb.email_attach_file,
+                   vb.email_address as vb_email, vb.delete_after_email
+            FROM extensions e
+            LEFT JOIN voicemail_boxes vb ON e.id = vb.extension_id AND vb.tenant_id = e.tenant_id
+            WHERE e.tenant_id = :tenant_id AND e.enabled = true AND e.deleted_at IS NULL
             """,
             {"tenant_id": tenant_id}
         )
@@ -124,10 +130,20 @@ async def handle_directory_request(form_data: Dict[str, Any]) -> str:
 
             u_elem = SubElement(users, "user", id=ext_num)
 
-            # User Parameters (Password & Auth)
+            # User Parameters (Password & Auth & Voicemail)
+            vm_pin = ext.get("vb_password") or ext.get("voicemail_pin") or "1234"
+            vm_email = ext.get("vb_email") or ext.get("email") or ""
+            keep_local = "false" if ext.get("delete_after_email") else "true"
+
             u_params = SubElement(u_elem, "params")
             SubElement(u_params, "param", name="password", value=sip_pwd)
             SubElement(u_params, "param", name="vm-password", value=vm_pin)
+            SubElement(u_params, "param", name="vm-enabled", value="true")
+            SubElement(u_params, "param", name="vm-email-all-messages", value="true")
+            SubElement(u_params, "param", name="vm-attach-file", value="true")
+            SubElement(u_params, "param", name="vm-keep-local-after-email", value=keep_local)
+            if vm_email:
+                SubElement(u_params, "param", name="vm-mailto", value=vm_email)
 
             # User Dialplan Variables
             u_vars = SubElement(u_elem, "variables")

@@ -332,9 +332,29 @@ async def handle_voicemail_webhook(request: Request):
     """
     Webhook called when a caller leaves a voicemail recording.
     Saves record to voicemail_messages and dispatches an email notification.
+    Supports JSON body, form data, or URL query parameters.
     """
     try:
-        data = await request.json()
+        data = {}
+        try:
+            data = await request.json()
+        except Exception:
+            pass
+
+        if not data:
+            data = dict(request.query_params)
+
+        if not data:
+            raw_body = await request.body()
+            if raw_body:
+                import json
+                import urllib.parse
+                try:
+                    data = json.loads(raw_body.decode("utf-8"))
+                except Exception:
+                    parsed = urllib.parse.parse_qs(raw_body.decode("utf-8"))
+                    data = {k: v[0] for k, v in parsed.items()}
+
         extension_number = data.get("extension_number")
         caller_id_number = data.get("caller_id_number", "Unknown")
         caller_id_name = data.get("caller_id_name") or caller_id_number

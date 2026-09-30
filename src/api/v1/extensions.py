@@ -394,6 +394,17 @@ async def update_extension_forwarding(
         raise HTTPException(status_code=404, detail="Extension not found")
     validate_tenant_access(current_user, str(ext["tenant_id"]))
 
+    # Clean boolean flags and destinations
+    fae = bool(payload.forward_always_enabled) if payload.forward_always_enabled is not None else False
+    fad = (payload.forward_always_destination or "").strip() or None if fae else None
+
+    fbe = bool(payload.forward_busy_enabled) if payload.forward_busy_enabled is not None else False
+    fbd = (payload.forward_busy_destination or "").strip() or None if fbe else None
+
+    fne = bool(payload.forward_no_answer_enabled) if payload.forward_no_answer_enabled is not None else False
+    fnd = (payload.forward_no_answer_destination or "").strip() or None if fne else None
+    fnt = int(payload.forward_no_answer_timeout or 20)
+
     upsert_sql = """
         INSERT INTO call_forwarding (
             extension_id, forward_always_enabled, forward_always_destination,
@@ -401,37 +412,78 @@ async def update_extension_forwarding(
             forward_no_answer_enabled, forward_no_answer_destination,
             forward_no_answer_timeout, updated_at
         ) VALUES (
-            :id, :fae, :fad, :fbe, :fbd, :fne, :fnd, :fnt, NOW()
+            CAST(:id AS uuid), :fae, :fad, :fbe, :fbd, :fne, :fnd, :fnt, NOW()
         )
         ON CONFLICT (extension_id) DO UPDATE SET
-            forward_always_enabled = COALESCE(EXCLUDED.forward_always_enabled, call_forwarding.forward_always_enabled),
+            forward_always_enabled = EXCLUDED.forward_always_enabled,
             forward_always_destination = EXCLUDED.forward_always_destination,
-            forward_busy_enabled = COALESCE(EXCLUDED.forward_busy_enabled, call_forwarding.forward_busy_enabled),
+            forward_busy_enabled = EXCLUDED.forward_busy_enabled,
             forward_busy_destination = EXCLUDED.forward_busy_destination,
-            forward_no_answer_enabled = COALESCE(EXCLUDED.forward_no_answer_enabled, call_forwarding.forward_no_answer_enabled),
+            forward_no_answer_enabled = EXCLUDED.forward_no_answer_enabled,
             forward_no_answer_destination = EXCLUDED.forward_no_answer_destination,
-            forward_no_answer_timeout = COALESCE(EXCLUDED.forward_no_answer_timeout, call_forwarding.forward_no_answer_timeout),
+            forward_no_answer_timeout = EXCLUDED.forward_no_answer_timeout,
             updated_at = NOW()
         RETURNING *
     """
     row = await execute_query_one(upsert_sql, {
         "id": extension_id,
-        "fae": payload.forward_always_enabled,
-        "fad": payload.forward_always_destination,
-        "fbe": payload.forward_busy_enabled,
-        "fbd": payload.forward_busy_destination,
-        "fne": payload.forward_no_answer_enabled,
-        "fnd": payload.forward_no_answer_destination,
-        "fnt": payload.forward_no_answer_timeout or 20
+        "fae": fae,
+        "fad": fad,
+        "fbe": fbe,
+        "fbd": fbd,
+        "fne": fne,
+        "fnd": fnd,
+        "fnt": fnt
     })
 
-    if payload.forward_always_enabled is not None:
-        await execute_query_one(
-            "UPDATE extensions SET call_forward_enabled = :en, call_forward_destination = :dest WHERE id = :id RETURNING id",
-            {"en": payload.forward_always_enabled, "dest": payload.forward_always_destination, "id": extension_id}
-        )
+    # Always keep extensions table in strict sync
+    await execute_query_one(
+        """
+        UPDATE extensions
+        SET call_forward_enabled = :en,
+            call_forward_destination = :dest,
+            call_forward_type = :ftype,
+            updated_at = NOW()
+        WHERE id = CAST(:id AS uuid)
+        RETURNING id
+        """,
+        {
+            "en": fae,
+            "dest": fad,
+            "ftype": "always" if fae else None,
+            "id": extension_id
+        }
+    )
 
     return dict(row)
+
+
+@router.delete("/{extension_id}/forwarding")
+async def delete_extension_forwarding(
+    extension_id: str,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN", "AGENT"]))
+):
+    """
+    Completely reset and remove all call forwarding rules for this extension.
+    """
+    ext = await execute_query_one("SELECT id, tenant_id FROM extensions WHERE id = :id AND deleted_at IS NULL", {"id": extension_id})
+    if not ext:
+        raise HTTPException(status_code=404, detail="Extension not found")
+    validate_tenant_access(current_user, str(ext["tenant_id"]))
+
+    await execute_query("DELETE FROM call_forwarding WHERE extension_id = CAST(:id AS uuid)", {"id": extension_id})
+    await execute_query(
+        """
+        UPDATE extensions
+        SET call_forward_enabled = false,
+            call_forward_destination = NULL,
+            call_forward_type = NULL,
+            updated_at = NOW()
+        WHERE id = CAST(:id AS uuid)
+        """,
+        {"id": extension_id}
+    )
+    return {"status": "success", "message": "Call forwarding rule deleted successfully"}
 
 
 @router.get("/{extension_id}/voicemail")

@@ -1,3 +1,4 @@
+import os
 import logging
 from xml.etree.ElementTree import Element, SubElement, tostring
 from typing import Dict, Any
@@ -225,6 +226,14 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="answer")
         SubElement(cond_elem, "action", application="sleep", data="500")
         SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,50,440)")
+        return format_xml(doc)
+
+    # Direct Voicemail Deposit (*99 + Extension, e.g. *991001)
+    if dest_number.startswith("*99") and len(dest_number) > 3:
+        target_vm_ext = dest_number[3:]
+        ext_elem = SubElement(context_elem, "extension", name=f"vm_deposit_{target_vm_ext}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=f"^\\*99{target_vm_ext}$")
+        add_voicemail_block(cond_elem, target_vm_ext, domain_name, tenant_id)
         return format_xml(doc)
 
     # Voicemail Star-codes (*97 self, *98 any)
@@ -592,7 +601,23 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SubElement(cond_elem, "action", application="bridge", data=bridge_data)
 
         # Voicemail fallback if callee does not answer or is unavailable
-        add_voicemail_block(cond_elem, ext_num, callee_domain, tenant_id)
+        custom_greeting = None
+        vm_box_row = await execute_query_one(
+            "SELECT greeting_path FROM voicemail_boxes WHERE extension_id = CAST(:ext_id AS uuid)",
+            {"ext_id": str(target_ext["id"])}
+        )
+        if vm_box_row and vm_box_row.get("greeting_path"):
+            gp = vm_box_row["greeting_path"]
+            for cand in [
+                f"/var/lib/freeswitch/recordings/audio/{gp}",
+                f"/var/lib/freeswitch/recordings/{gp}",
+                f"/app/media/audio/{gp}"
+            ]:
+                if os.path.exists(cand):
+                    custom_greeting = cand
+                    break
+
+        add_voicemail_block(cond_elem, ext_num, callee_domain, tenant_id, greeting_file=custom_greeting)
         return format_xml(doc)
 
     # =========================================================================
@@ -757,15 +782,15 @@ async def evaluate_and_route_business_hours(cond_elem: Element, target: str, ten
         SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/{dest_target}" + "@" + f"{domain_name}")
 
 
-def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str):
+def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str, greeting_file: str = None):
     """
     Appends full Voicemail execution actions:
     1. Answers the channel
     2. Sets channel variables for CDR fallback logging
-    3. Plays 'User not available, please leave a voicemail' greeting
+    3. Plays custom or default 'User not available' greeting
     4. Plays 1000Hz beep tone
     5. Records caller's audio message to disk
-    6. Calls API webhook to record to database and queue email dispatch
+    6. Calls API webhook via query params & JSON to guarantee recording capture
     7. Hangs up cleanly
     """
     vm_file = f"/var/lib/freeswitch/recordings/voicemail/{ext_num}_${{uuid}}.wav"
@@ -774,19 +799,25 @@ def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id
     SubElement(cond_elem, "action", application="sleep", data="500")
     SubElement(cond_elem, "action", application="set", data=f"voicemail_target={ext_num}")
     SubElement(cond_elem, "action", application="set", data=f"voicemail_file={vm_file}")
-    # Play Voicemail Prompt
-    SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/voicemail_greeting.wav")
+
+    # Play Custom Voicemail Greeting if configured and exists, else default prompt
+    if greeting_file and os.path.exists(greeting_file):
+        SubElement(cond_elem, "action", application="playback", data=greeting_file)
+    else:
+        SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/voicemail_greeting.wav")
+
     # Play Beep Tone
     SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/beep.wav")
     # Record message: max 120s, threshold 200, silence terminate 4s
     SubElement(cond_elem, "action", application="record", data=f"{vm_file} 120 200 4")
-    # Trigger webhook with call details for email notification and database entry
-    curl_json = f'{{"extension_number":"{ext_num}","caller_id_number":"${{caller_id_number}}","caller_id_name":"${{caller_id_name}}","file_path":"{vm_file}","duration":15,"tenant_id":"{tenant_id}"}}'
+
+    # Trigger webhook with call details (using URL query parameters for 100% reliability in mod_curl)
+    curl_url = f"http://api:8000/freeswitch/voicemail?extension_number={ext_num}&caller_id_number=${{caller_id_number}}&caller_id_name=${{caller_id_name}}&file_path={vm_file}&duration=15&tenant_id={tenant_id}"
     SubElement(
         cond_elem,
         "action",
         application="curl",
-        data=f"http://api:8000/freeswitch/voicemail post json {curl_json}"
+        data=f"{curl_url} post"
     )
     SubElement(cond_elem, "action", application="hangup")
 
