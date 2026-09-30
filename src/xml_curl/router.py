@@ -348,7 +348,16 @@ async def handle_voicemail_webhook(request: Request):
     Saves record to voicemail_messages and dispatches an email notification.
     """
     try:
-        data = await request.json()
+        data = {}
+        try:
+            data = await request.json()
+        except Exception:
+            pass
+        if not data:
+            data = dict(request.query_params)
+        if not data:
+            form = await request.form()
+            data = dict(form)
         extension_number = data.get("extension_number")
         caller_id_number = data.get("caller_id_number", "Unknown")
         caller_id_name = data.get("caller_id_name") or caller_id_number

@@ -1,7 +1,7 @@
-import os
 import logging
+import socket
 from xml.etree.ElementTree import Element, SubElement, tostring
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from src.core.database import execute_query_one, execute_query
 
 logger = logging.getLogger("pbx.xml_curl.dialplan")
@@ -20,6 +20,30 @@ VOICEMAIL_CONTINUE_ON_FAIL = (
     "PROGRESS_TIMEOUT,RECOVERY_ON_TIMER_EXPIRE,SERVICE_NOT_IMPLEMENTED,"
     "SUBSCRIBER_ABSENT,UNALLOCATED_NUMBER,INCOMPATIBLE_DESTINATION"
 )
+
+
+def check_registered_domain(ext_num: str, candidate_domains: List[str]) -> Optional[str]:
+    """
+    Directly queries FreeSWITCH mod_event_socket to find where an extension is actively registered.
+    Returns the exact registered domain (e.g. '127.0.0.1' or 'pbx.aikyamlabs.local') or None if offline.
+    """
+    try:
+        s = socket.socket()
+        s.settimeout(1.0)
+        s.connect(('freeswitch', 8021))
+        s.recv(1024)
+        s.sendall(b'auth ClueCon\n\n')
+        s.recv(1024)
+        for dom in candidate_domains:
+            s.sendall(f'api sofia_contact */{ext_num}@{dom}\n\n'.encode())
+            resp = s.recv(1024).decode()
+            if "error/user_not_registered" not in resp and "sofia/internal" in resp:
+                s.close()
+                return dom
+        s.close()
+    except Exception as e:
+        logger.warning(f"Error checking sofia registration for {ext_num}: {e}")
+    return None
 
 
 async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
@@ -71,206 +95,9 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     section = SubElement(doc, "section", name="dialplan", description="Dynamic Multi-Tenant Dialplan")
     context_elem = SubElement(section, "context", name=context)
 
-    # -------------------------------------------------------------------------
-    # CALL BLOCK (BLACKLIST) CHECK
-    # -------------------------------------------------------------------------
-    if tenant_id and caller_id_number:
-        try:
-            blocked = await execute_query_one(
-                "SELECT action FROM call_block WHERE tenant_id = CAST(:tid AS uuid) AND number = :num AND enabled = true",
-                {"tid": tenant_id, "num": caller_id_number}
-            )
-            if blocked:
-                act = blocked.get("action", "reject")
-                logger.warning(f"Blocked call from blacklisted caller '{caller_id_number}' (action={act})")
-                ext_elem = SubElement(context_elem, "extension", name="blocked_call")
-                cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-                if act == "busy":
-                    SubElement(cond_elem, "action", application="respond", data="486 Busy Here")
-                elif act == "voicemail":
-                    add_voicemail_block(cond_elem, "1001", domain_name, tenant_id)
-                else:
-                    SubElement(cond_elem, "action", application="respond", data="603 Declined")
-                return format_xml(doc)
-        except Exception as e:
-            logger.error(f"Error checking call_block: {e}")
-
     # =========================================================================
     # SCENARIO 1: SPECIAL FEATURE CODES
     # =========================================================================
-    # Direct Pickup: **<ext>
-    if dest_number.startswith("**") and len(dest_number) > 2:
-        target = dest_number[2:]
-        ext_elem = SubElement(context_elem, "extension", name=f"direct_pickup_{target}")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
-        SubElement(cond_elem, "action", application="intercept", data=f"user/{target}@{domain_name}")
-        return format_xml(doc)
-
-    # Group Pickup: *8
-    if dest_number == "*8":
-        ext_elem = SubElement(context_elem, "extension", name="group_pickup")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*8$")
-        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
-        SubElement(cond_elem, "action", application="intercept", data=f"all@{domain_name}")
-        return format_xml(doc)
-
-    # Eavesdrop / Spy: *33<ext>
-    if dest_number.startswith("*33") and len(dest_number) > 3:
-        target = dest_number[3:]
-        ext_elem = SubElement(context_elem, "extension", name=f"eavesdrop_{target}")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="eavesdrop", data=f"user/{target}@{domain_name}")
-        return format_xml(doc)
-
-    # Whisper: *34<ext>
-    if dest_number.startswith("*34") and len(dest_number) > 3:
-        target = dest_number[3:]
-        ext_elem = SubElement(context_elem, "extension", name=f"whisper_{target}")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="set", data="eavesdrop_whisper_aleg=true")
-        SubElement(cond_elem, "action", application="eavesdrop", data=f"user/{target}@{domain_name}")
-        return format_xml(doc)
-
-    # Intercom / Auto-answer page: *80<ext>
-    if dest_number.startswith("*80") and len(dest_number) > 3:
-        target = dest_number[3:]
-        ext_elem = SubElement(context_elem, "extension", name=f"intercom_{target}")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
-        SubElement(cond_elem, "action", application="export", data="sip_h_Call-Info=<sip:x>;answer-after=0")
-        SubElement(cond_elem, "action", application="export", data="sip_auto_answer=true")
-        SubElement(cond_elem, "action", application="export", data="sip_h_Alert-Info=Ring Answer")
-        SubElement(cond_elem, "action", application="bridge", data=f"user/{target}@{domain_name}")
-        return format_xml(doc)
-
-    # Valet Call Parking (*5900 park, *5901-*5999 or 5901-5999 retrieve)
-    if dest_number == "*5900":
-        ext_elem = SubElement(context_elem, "extension", name="valet_park")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*5900$")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="sleep", data="500")
-        SubElement(cond_elem, "action", application="valet_park", data=f"parklot_{tenant_id} auto in 5901 5999")
-        return format_xml(doc)
-
-    if (dest_number.startswith("*59") or (dest_number.startswith("59") and dest_number.isdigit())) and len(dest_number.replace("*", "")) == 4:
-        slot = dest_number.replace("*", "")
-        ext_elem = SubElement(context_elem, "extension", name=f"valet_unpark_{slot}")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="valet_park", data=f"parklot_{tenant_id} out {slot}")
-        return format_xml(doc)
-
-    # Do Not Disturb (*78 enable, *79 disable)
-    if dest_number == "*78":
-        if tenant_id and caller_id_number:
-            await execute_query(
-                '''INSERT INTO dnd_settings (extension_id, enabled, updated_at)
-                   SELECT id, true, NOW() FROM extensions WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :num
-                   ON CONFLICT (extension_id) DO UPDATE SET enabled = true, updated_at = NOW()''',
-                {"tid": tenant_id, "num": caller_id_number}
-            )
-        ext_elem = SubElement(context_elem, "extension", name="dnd_on")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*78$")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="sleep", data="500")
-        SubElement(cond_elem, "action", application="playback", data="tone_stream://%(250,50,440);%(250,50,440)")
-        return format_xml(doc)
-
-    if dest_number == "*79":
-        if tenant_id and caller_id_number:
-            await execute_query(
-                '''INSERT INTO dnd_settings (extension_id, enabled, updated_at)
-                   SELECT id, false, NOW() FROM extensions WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :num
-                   ON CONFLICT (extension_id) DO UPDATE SET enabled = false, updated_at = NOW()''',
-                {"tid": tenant_id, "num": caller_id_number}
-            )
-        ext_elem = SubElement(context_elem, "extension", name="dnd_off")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*79$")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="sleep", data="500")
-        SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,50,440)")
-        return format_xml(doc)
-
-    # Call Forwarding (*72<dest> enable, *73 disable)
-    if dest_number.startswith("*72") and len(dest_number) > 3:
-        fwd_target = dest_number[3:]
-        if tenant_id and caller_id_number:
-            await execute_query(
-                '''INSERT INTO call_forwarding (extension_id, forward_always_enabled, forward_always_destination, updated_at)
-                   SELECT id, true, :target, NOW() FROM extensions WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :num
-                   ON CONFLICT (extension_id) DO UPDATE SET forward_always_enabled = true, forward_always_destination = :target, updated_at = NOW()''',
-                {"tid": tenant_id, "num": caller_id_number, "target": fwd_target}
-            )
-        ext_elem = SubElement(context_elem, "extension", name="cf_on")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="sleep", data="500")
-        SubElement(cond_elem, "action", application="playback", data="tone_stream://%(250,50,440);%(250,50,440)")
-        return format_xml(doc)
-
-    if dest_number == "*73":
-        if tenant_id and caller_id_number:
-            await execute_query(
-                '''INSERT INTO call_forwarding (extension_id, forward_always_enabled, updated_at)
-                   SELECT id, false, NOW() FROM extensions WHERE tenant_id = CAST(:tid AS uuid) AND extension_number = :num
-                   ON CONFLICT (extension_id) DO UPDATE SET forward_always_enabled = false, updated_at = NOW()''',
-                {"tid": tenant_id, "num": caller_id_number}
-            )
-        ext_elem = SubElement(context_elem, "extension", name="cf_off")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*73$")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="sleep", data="500")
-        SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,50,440)")
-        return format_xml(doc)
-
-    # Direct Voicemail Deposit (*99 + Extension, e.g. *991001)
-    if dest_number.startswith("*99") and len(dest_number) > 3:
-        target_vm_ext = dest_number[3:]
-        ext_elem = SubElement(context_elem, "extension", name=f"vm_deposit_{target_vm_ext}")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=f"^\\*99{target_vm_ext}$")
-        add_voicemail_block(cond_elem, target_vm_ext, domain_name, tenant_id)
-        return format_xml(doc)
-
-    # Voicemail Star-codes (*97 self, *98 any)
-    if dest_number == "*97":
-        ext_elem = SubElement(context_elem, "extension", name="voicemail_self")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*97$")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="sleep", data="500")
-        SubElement(cond_elem, "action", application="voicemail", data=f"check default {domain_name} {caller_id_number}")
-        return format_xml(doc)
-
-    if dest_number == "*98":
-        ext_elem = SubElement(context_elem, "extension", name="voicemail_any")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^\*98$")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="sleep", data="500")
-        SubElement(cond_elem, "action", application="voicemail", data=f"check default {domain_name}")
-        return format_xml(doc)
-
-    # Conference Rooms (3000 to 3999)
-    if dest_number.isdigit() and 3000 <= int(dest_number) <= 3999:
-        conf_room = None
-        if tenant_id:
-            conf_room = await execute_query_one(
-                "SELECT id, name, pin, moderator_pin, record_conference, enabled FROM conferences WHERE extension_number = :dest AND (tenant_id = CAST(:tid AS uuid) OR tenant_id IS NULL) AND enabled = true",
-                {"dest": dest_number, "tid": tenant_id}
-            )
-        conf_name = f"conf_{tenant_id}_{dest_number}"
-        ext_elem = SubElement(context_elem, "extension", name=f"conf_{dest_number}")
-        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
-        SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="sleep", data="500")
-        if conf_room and conf_room.get("record_conference"):
-            SubElement(cond_elem, "action", application="record_session", data=f"/var/lib/freeswitch/recordings/{tenant_id}/conf_{dest_number}_${{uuid}}.wav")
-        SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
-        return format_xml(doc)
     if dest_number in ("*96", "9196"):
         ext_elem = SubElement(context_elem, "extension", name="echo_test")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=r"^(\*96|9196)$")
@@ -288,6 +115,16 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="direction=internal")
         SubElement(cond_elem, "action", application="answer")
         SubElement(cond_elem, "action", application="playback", data="local_stream://moh")
+        return format_xml(doc)
+
+    # Dedicated Voicemail Destination (triggered via transfer_on_fail or direct transfer)
+    if dest_number.startswith("voicemail_"):
+        target_ext_num = dest_number.replace("voicemail_", "").strip()
+        ext_elem = SubElement(context_elem, "extension", name=f"voicemail_route_{target_ext_num}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="set", data="direction=internal")
+        add_voicemail_block(cond_elem, target_ext_num, domain_name, tenant_id)
         return format_xml(doc)
 
     # =========================================================================
@@ -492,9 +329,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
             SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
 
-            if dest_type in ("business_hours", "time_condition"):
-                await evaluate_and_route_business_hours(cond_elem, target, tenant_id, domain_name, context)
-            elif dest_type == "extension":
+            if dest_type == "extension":
                 SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/{target}@{domain_name}")
                 add_voicemail_block(cond_elem, target, domain_name, tenant_id)
             elif dest_type == "queue":
@@ -529,7 +364,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         # Configurable no-answer timeout (per extension or default 20s)
         timeout = target_ext.get("no_answer_timeout")
         if not timeout or not isinstance(timeout, int) or timeout <= 0:
-            timeout = 20
+            timeout = 15
 
         ext_elem = SubElement(context_elem, "extension", name=f"internal_ext_{ext_num}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=f"^{ext_num}$")
@@ -537,18 +372,6 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         # Set standard call & CDR variables
         SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
         SubElement(cond_elem, "action", application="set", data="direction=internal")
-
-        # Disconnect calling party immediately when either party hangs up
-        SubElement(cond_elem, "action", application="set", data="hangup_after_bridge=true")
-        SubElement(cond_elem, "action", application="export", data="hangup_after_bridge=true")
-
-        # Only continue down the dialplan if the call was NOT answered or failed
-        SubElement(
-            cond_elem,
-            "action",
-            application="set",
-            data=f"continue_on_fail={VOICEMAIL_CONTINUE_ON_FAIL}"
-        )
 
         # Ringing timeout variables
         SubElement(cond_elem, "action", application="set", data=f"call_timeout={timeout}")
@@ -559,20 +382,15 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
         SubElement(cond_elem, "action", application="export", data="sip_contact_user=${destination_number}")
 
-        # Voice Call Recording
+        # Record call ONLY upon answer (so no premature early media during ringing)
         rec_path = f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav"
         SubElement(cond_elem, "action", application="set", data=f"recording_file={rec_path}")
-        SubElement(cond_elem, "action", application="record_session", data=rec_path)
+        SubElement(cond_elem, "action", application="set", data=f"execute_on_answer=record_session {rec_path}")
 
-        # Check Do Not Disturb (DND)
-        dnd_record = await execute_query_one(
-            "SELECT enabled FROM dnd_settings WHERE extension_id = CAST(:ext_id AS uuid)",
-            {"ext_id": str(target_ext["id"])}
-        )
-        if dnd_record and dnd_record.get("enabled"):
-            logger.info(f"Extension {ext_num} has DND enabled, redirecting to voicemail")
-            add_voicemail_block(cond_elem, ext_num, callee_domain, tenant_id)
-            return format_xml(doc)
+        # Voicemail failover triggers immediately on busy/reject/timeout
+        SubElement(cond_elem, "action", application="set", data="failure_causes=USER_BUSY,NO_ANSWER,CALL_REJECTED,ORIGINATOR_CANCEL,DESTINATION_OUT_OF_ORDER,NORMAL_TEMPORARY_FAILURE")
+        SubElement(cond_elem, "action", application="set", data=f"transfer_on_fail=voicemail_{ext_num} XML {context}")
+        SubElement(cond_elem, "action", application="set", data="continue_on_fail=true")
 
         # Check Call Forwarding
         cf_record = await execute_query_one(
@@ -589,35 +407,26 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         if cf_record and cf_record.get("forward_always_enabled") and cf_record.get("forward_always_destination"):
             cf_dest = cf_record["forward_always_destination"]
             logger.info(f"Extension {ext_num} has unconditional forward to {cf_dest}")
-            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={timeout},originate_timeout={timeout}]user/{cf_dest}@{callee_domain}")
+            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={timeout}]user/{cf_dest}@{callee_domain}")
+            SubElement(cond_elem, "action", application="transfer", data=f"voicemail_{ext_num} XML {context}")
         else:
-            # Standard bridge to callee with multi-domain fallback (|) to support both pbx.aikyamlabs.local and 127.0.0.1 registrations
-            bridge_targets = [f"user/{ext_num}@{callee_domain}"]
-            if callee_domain != "pbx.aikyamlabs.local":
-                bridge_targets.append(f"user/{ext_num}@pbx.aikyamlabs.local")
-            if callee_domain != "127.0.0.1":
-                bridge_targets.append(f"user/{ext_num}@127.0.0.1")
-            bridge_data = f"[leg_timeout={timeout},originate_timeout={timeout}]" + "|".join(bridge_targets)
-            SubElement(cond_elem, "action", application="bridge", data=bridge_data)
+            # Query FreeSWITCH to check if and where the callee extension is actively registered
+            candidate_domains = list(dict.fromkeys(["127.0.0.1", callee_domain, "pbx.aikyamlabs.local"]))
+            active_domain = check_registered_domain(ext_num, candidate_domains)
 
-        # Voicemail fallback if callee does not answer or is unavailable
-        custom_greeting = None
-        vm_box_row = await execute_query_one(
-            "SELECT greeting_path FROM voicemail_boxes WHERE extension_id = CAST(:ext_id AS uuid)",
-            {"ext_id": str(target_ext["id"])}
-        )
-        if vm_box_row and vm_box_row.get("greeting_path"):
-            gp = vm_box_row["greeting_path"]
-            for cand in [
-                f"/var/lib/freeswitch/recordings/audio/{gp}",
-                f"/var/lib/freeswitch/recordings/{gp}",
-                f"/app/media/audio/{gp}"
-            ]:
-                if os.path.exists(cand):
-                    custom_greeting = cand
-                    break
+            if active_domain:
+                logger.info(f"Callee {ext_num} is actively registered on {active_domain}. Bridging...")
+                SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={timeout}]user/{ext_num}@{active_domain}")
+                SubElement(cond_elem, "action", application="transfer", data=f"voicemail_{ext_num} XML {context}")
+            else:
+                logger.info(f"Callee {ext_num} is offline (unregistered). Routing directly to voicemail.")
+                SubElement(cond_elem, "action", application="transfer", data=f"voicemail_{ext_num} XML {context}")
 
-        add_voicemail_block(cond_elem, ext_num, callee_domain, tenant_id, greeting_file=custom_greeting)
+        # Also declare the voicemail extension in the same context for instantaneous in-memory transfer
+        vm_ext_elem = SubElement(context_elem, "extension", name=f"voicemail_{ext_num}")
+        vm_cond_elem = SubElement(vm_ext_elem, "condition", field="destination_number", expression=f"^voicemail_{ext_num}$")
+        add_voicemail_block(vm_cond_elem, ext_num, callee_domain, tenant_id)
+
         return format_xml(doc)
 
     # =========================================================================
@@ -681,144 +490,47 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     return NOT_FOUND_XML
 
 
-
-async def evaluate_and_route_business_hours(cond_elem: Element, target: str, tenant_id: str, domain_name: str, context: str):
-    """
-    Evaluates business hours schedule, checks holidays and weekly open/close window,
-    and appends FreeSWITCH routing actions to cond_elem.
-    """
-    import zoneinfo
-    from datetime import datetime, date
-
-    bh_row = None
-    try:
-        bh_row = await execute_query_one(
-            """
-            SELECT id, name, timezone, schedule,
-                   open_destination_type, open_destination_target,
-                   closed_destination_type, closed_destination_target,
-                   holiday_destination_type, holiday_destination_target
-            FROM business_hours
-            WHERE (id::text = :target OR tenant_id = :tenant_id)
-            ORDER BY (id::text = :target) DESC
-            LIMIT 1
-            """,
-            {"target": str(target or ""), "tenant_id": tenant_id}
-        )
-    except Exception as e:
-        logger.error(f"Error querying business_hours: {e}")
-
-    if not bh_row:
-        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/1001" + "@" + f"{domain_name}")
-        add_voicemail_block(cond_elem, "1001", domain_name, tenant_id)
-        return
-
-    tz_str = bh_row.get("timezone") or "UTC"
-    try:
-        tz = zoneinfo.ZoneInfo(tz_str)
-    except Exception:
-        tz = zoneinfo.ZoneInfo("UTC")
-
-    now_tz = datetime.now(tz)
-    today_date = now_tz.date()
-    curr_time_str = now_tz.strftime("%H:%M")
-    day_name = now_tz.strftime("%A").lower()
-
-    holidays = []
-    try:
-        holidays = await execute_query(
-            "SELECT holiday_date FROM holidays WHERE business_hours_id = :bh_id",
-            {"bh_id": bh_row["id"]}
-        )
-    except Exception as e:
-        logger.error(f"Error querying holidays: {e}")
-
-    is_holiday = any(h.get("holiday_date") == today_date for h in holidays)
-
-    if is_holiday:
-        status = "HOLIDAY"
-        dest_type = bh_row.get("holiday_destination_type") or bh_row.get("closed_destination_type") or "voicemail"
-        dest_target = bh_row.get("holiday_destination_target") or bh_row.get("closed_destination_target") or "1001"
-    else:
-        sched = bh_row.get("schedule") or {}
-        if isinstance(sched, str):
-            import json
-            try:
-                sched = json.loads(sched)
-            except Exception:
-                sched = {}
-        day_conf = sched.get(day_name) or {}
-        is_open = False
-        if day_conf.get("enabled"):
-            o = day_conf.get("open", "00:00")
-            c = day_conf.get("close", "23:59")
-            if o <= curr_time_str < c:
-                is_open = True
-
-        if is_open:
-            status = "OPEN"
-            dest_type = bh_row.get("open_destination_type") or "extension"
-            dest_target = bh_row.get("open_destination_target") or "1001"
-        else:
-            status = "CLOSED"
-            dest_type = bh_row.get("closed_destination_type") or "voicemail"
-            dest_target = bh_row.get("closed_destination_target") or "1001"
-
-    SubElement(cond_elem, "action", application="set", data=f"business_hours_status={status}")
-    SubElement(cond_elem, "action", application="set", data=f"business_hours_name={bh_row.get('name')}")
-
-    if dest_type == "extension":
-        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/{dest_target}" + "@" + f"{domain_name}")
-        add_voicemail_block(cond_elem, dest_target, domain_name, tenant_id)
-    elif dest_type == "ivr":
-        SubElement(cond_elem, "action", application="transfer", data=f"{dest_target or '6001'} XML {context}")
-    elif dest_type in ("hunt_group", "queue"):
-        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/1001" + "@" + f"{domain_name},user/1002" + "@" + f"{domain_name}")
-    elif dest_type == "conference":
-        SubElement(cond_elem, "action", application="conference", data=f"{dest_target}" + "@" + f"{domain_name}")
-    elif dest_type == "voicemail":
-        add_voicemail_block(cond_elem, dest_target, domain_name, tenant_id)
-    else:
-        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/{dest_target}" + "@" + f"{domain_name}")
-
-
-def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str, greeting_file: str = None):
+def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str):
     """
     Appends full Voicemail execution actions:
     1. Answers the channel
     2. Sets channel variables for CDR fallback logging
-    3. Plays custom or default 'User not available' greeting
+    3. Plays 'User not available, please leave a voicemail' greeting
     4. Plays 1000Hz beep tone
     5. Records caller's audio message to disk
-    6. Calls API webhook via query params & JSON to guarantee recording capture
+    6. Calls API webhook to record to database and queue email dispatch
     7. Hangs up cleanly
     """
     vm_file = f"/var/lib/freeswitch/recordings/voicemail/{ext_num}_${{uuid}}.wav"
+    rec_path = f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav"
 
+    SubElement(cond_elem, "action", application="stop_record_session", data=rec_path)
     SubElement(cond_elem, "action", application="answer")
-    SubElement(cond_elem, "action", application="sleep", data="500")
+    SubElement(cond_elem, "action", application="sleep", data="1000")
     SubElement(cond_elem, "action", application="set", data=f"voicemail_target={ext_num}")
     SubElement(cond_elem, "action", application="set", data=f"voicemail_file={vm_file}")
+    SubElement(cond_elem, "action", application="set", data="playback_terminators=#*")
 
-    # Play Custom Voicemail Greeting if configured and exists, else default prompt
-    if greeting_file and os.path.exists(greeting_file):
-        SubElement(cond_elem, "action", application="playback", data=greeting_file)
-    else:
-        SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/voicemail_greeting.wav")
+    # Configure hangup hook so that if caller hangs up during or after speaking, the email webhook always triggers
+    curl_url = f"http://api:8000/freeswitch/voicemail?extension_number={ext_num}&caller_id_number=${{caller_id_number}}&caller_id_name=${{caller_id_name}}&file_path={vm_file}&duration=15&tenant_id={tenant_id}"
+    SubElement(cond_elem, "action", application="set", data=f"api_hangup_hook=curl {curl_url} post")
+    SubElement(cond_elem, "action", application="set", data="session_in_hangup_hook=true")
 
-    # Play Beep Tone
-    SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/beep.wav")
+    # Play Voicemail Prompt
+    SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/voicemail_greeting.wav")
+    # Play Beep Tone (native FreeSWITCH 1000Hz tone for 500ms)
+    SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,0,1000)")
     # Record message: max 120s, threshold 200, silence terminate 4s
     SubElement(cond_elem, "action", application="record", data=f"{vm_file} 120 200 4")
-
-    # Trigger webhook with call details (using URL query parameters for 100% reliability in mod_curl)
-    curl_url = f"http://api:8000/freeswitch/voicemail?extension_number={ext_num}&caller_id_number=${{caller_id_number}}&caller_id_name=${{caller_id_name}}&file_path={vm_file}&duration=15&tenant_id={tenant_id}"
+    # Trigger webhook directly if caller completed record via # or silence without hanging up
     SubElement(
         cond_elem,
         "action",
         application="curl",
         data=f"{curl_url} post"
     )
+    # Clear api_hangup_hook to avoid double invocation on final hangup
+    SubElement(cond_elem, "action", application="set", data="api_hangup_hook=")
     SubElement(cond_elem, "action", application="hangup")
 
 
