@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import asyncio
 import urllib.parse
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -8,6 +9,7 @@ from fastapi import APIRouter, Request, Response
 from src.xml_curl.directory import handle_directory_request
 from src.xml_curl.dialplan import handle_dialplan_request
 from src.core.database import execute_query_one, execute_query
+from src.core.email_service import send_voicemail_notification
 
 logger = logging.getLogger("pbx.xml_curl.router")
 
@@ -318,6 +320,18 @@ async def handle_json_cdr(request: Request):
                         {"id": vm_msg_id, "vbox_id": vm_box_id, "cname": caller_name, "cnum": caller_number, "fpath": vm_file, "dur": vm_dur}
                     )
                     logger.info(f"Voicemail successfully captured via CDR: id={vm_msg_id}, target={vm_target}, caller={caller_number}, size={vm_size} bytes")
+
+                    # Asynchronously dispatch voicemail email notification
+                    asyncio.create_task(
+                        send_voicemail_notification(
+                            extension_number=vm_target,
+                            caller_id_number=caller_number,
+                            caller_id_name=caller_name,
+                            file_path=vm_file,
+                            duration=vm_dur,
+                            tenant_id=tenant_id
+                        )
+                    )
             except Exception as vm_exc:
                 logger.warning(f"Error saving voicemail from CDR: {vm_exc}")
 
@@ -332,29 +346,9 @@ async def handle_voicemail_webhook(request: Request):
     """
     Webhook called when a caller leaves a voicemail recording.
     Saves record to voicemail_messages and dispatches an email notification.
-    Supports JSON body, form data, or URL query parameters.
     """
     try:
-        data = {}
-        try:
-            data = await request.json()
-        except Exception:
-            pass
-
-        if not data:
-            data = dict(request.query_params)
-
-        if not data:
-            raw_body = await request.body()
-            if raw_body:
-                import json
-                import urllib.parse
-                try:
-                    data = json.loads(raw_body.decode("utf-8"))
-                except Exception:
-                    parsed = urllib.parse.parse_qs(raw_body.decode("utf-8"))
-                    data = {k: v[0] for k, v in parsed.items()}
-
+        data = await request.json()
         extension_number = data.get("extension_number")
         caller_id_number = data.get("caller_id_number", "Unknown")
         caller_id_name = data.get("caller_id_name") or caller_id_number
@@ -411,8 +405,20 @@ async def handle_voicemail_webhook(request: Request):
             {"id": msg_id, "vbox_id": vm_box_id, "cname": caller_id_name, "cnum": caller_id_number, "fpath": file_path, "dur": duration}
         )
 
+        # Asynchronously dispatch voicemail email notification
+        asyncio.create_task(
+            send_voicemail_notification(
+                extension_number=extension_number,
+                caller_id_number=caller_id_number,
+                caller_id_name=caller_id_name,
+                file_path=file_path,
+                duration=duration,
+                tenant_id=tenant_id
+            )
+        )
+
         logger.info(
-            f" [VOICEMAIL NOTIFICATION EMAIL] To: {recipient_email} | Subject: New Voicemail from {caller_id_number} "
+            f" [VOICEMAIL NOTIFICATION DISPATCHED] To: {recipient_email} | Subject: New Voicemail from {caller_id_number} "
             f"| Duration: {duration}s | Attachment: {file_path}"
         )
         return {"status": "success", "message_id": msg_id, "email_sent_to": recipient_email}
