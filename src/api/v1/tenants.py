@@ -152,7 +152,7 @@ async def update_tenant(
         SET name = COALESCE(:name, name),
             domain = COALESCE(:domain, domain),
             sip_domain = COALESCE(:sip_domain, sip_domain),
-            branding = CASE WHEN :branding IS NOT NULL THEN CAST(:branding AS jsonb) ELSE branding END,
+            branding = COALESCE(CAST(:branding AS jsonb), branding),
             timezone = COALESCE(:timezone, timezone),
             enabled = COALESCE(:enabled, enabled),
             max_extensions = COALESCE(:max_extensions, max_extensions),

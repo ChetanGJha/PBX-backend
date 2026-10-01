@@ -3,6 +3,7 @@ import socket
 from xml.etree.ElementTree import Element, SubElement, tostring
 from typing import Dict, Any, List, Optional
 from src.core.database import execute_query_one, execute_query
+from src.services.voicemail_prompt import ensure_voicemail_prompt
 
 logger = logging.getLogger("pbx.xml_curl.dialplan")
 
@@ -572,12 +573,21 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         # Strip dialing prefix 9 if present
         dialed_digits = dest_number[1:] if dest_number.startswith("9") else dest_number
 
-        # Check for assigned dedicated trunk or global shared trunk in database
+        # Check for assigned dedicated trunk (via tenant_sip_trunks or legacy tenant_id) or global shared trunk (0 tenants assigned)
         trunk = await execute_query_one(
             """
-            SELECT name, host, port FROM sip_trunks
-            WHERE (tenant_id = CAST(:tid AS uuid) OR tenant_id IS NULL) AND enabled = true AND deleted_at IS NULL
-            ORDER BY (tenant_id IS NOT NULL) DESC, priority ASC LIMIT 1
+            SELECT t.name, t.host, t.port FROM sip_trunks t
+            LEFT JOIN tenant_sip_trunks tst ON t.id = tst.trunk_id
+            WHERE (
+                tst.tenant_id = CAST(:tid AS uuid)
+                OR t.tenant_id = CAST(:tid AS uuid)
+                OR (
+                    NOT EXISTS (SELECT 1 FROM tenant_sip_trunks WHERE trunk_id = t.id)
+                    AND t.tenant_id IS NULL
+                )
+            )
+            AND t.enabled = true AND t.deleted_at IS NULL
+            ORDER BY (tst.tenant_id IS NOT NULL OR t.tenant_id IS NOT NULL) DESC, t.priority ASC LIMIT 1
             """,
             {"tid": tenant_id}
         )
@@ -643,8 +653,9 @@ def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id
     SubElement(cond_elem, "action", application="set", data=f"api_hangup_hook=curl {curl_url} post")
     SubElement(cond_elem, "action", application="set", data="session_in_hangup_hook=true")
 
-    # Play Voicemail Prompt
-    SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/voicemail_greeting.wav")
+    # Play customized Voicemail Prompt ("User at extension {ext_num} is not available, please leave a voice message after the beep")
+    prompt_path = ensure_voicemail_prompt(ext_num)
+    SubElement(cond_elem, "action", application="playback", data=prompt_path)
     # Play Beep Tone (native FreeSWITCH 1000Hz tone for 500ms)
     SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,0,1000)")
     # Record message: max 120s, threshold 200, silence terminate 4s

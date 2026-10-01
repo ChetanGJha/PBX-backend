@@ -17,7 +17,8 @@ class UserCreate(BaseModel):
     password: str = Field(..., min_length=8)
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    role: str = Field("AGENT", description="Role: TENANT_ADMIN, SUPERVISOR, AGENT")
+    role: str = Field("AGENT", description="Role: TENANT_ADMIN, SUB_ADMIN, SUPERVISOR, AGENT")
+    allowed_modules: Optional[List[str]] = Field(default_factory=list)
 
 
 class UserResponse(BaseModel):
@@ -30,6 +31,7 @@ class UserResponse(BaseModel):
     first_name: Optional[str]
     last_name: Optional[str]
     role: str
+    allowed_modules: Optional[List[str]] = None
     is_active: bool
     created_at: str
 
@@ -57,6 +59,7 @@ async def list_users(
         SELECT u.id, u.tenant_id, t.name as tenant_name, t.domain as tenant_domain,
                u.username, u.email, u.first_name, u.last_name, u.is_active,
                COALESCE(r.name, 'AGENT') as role,
+               COALESCE(u.allowed_modules, '[]'::jsonb) as allowed_modules,
                u.created_at::text as created_at
         FROM users u
         LEFT JOIN tenants t ON u.tenant_id = t.id
@@ -100,19 +103,28 @@ async def create_user(
             detail="tenant_id is required for non-SuperAdmin users."
         )
 
-    # Check if username or email exists
-    existing = await execute_query_one(
-        "SELECT id FROM users WHERE (username = :u OR email = :e) AND deleted_at IS NULL",
-        {"u": payload.username, "e": payload.email}
-    )
+    # Check if username or email exists in the tenant context
+    if target_tenant:
+        existing = await execute_query_one(
+            "SELECT id, username, email FROM users WHERE tenant_id = CAST(:t_id AS uuid) AND (username = :u OR email = :e) AND deleted_at IS NULL",
+            {"t_id": str(target_tenant), "u": payload.username, "e": payload.email}
+        )
+    else:
+        existing = await execute_query_one(
+            "SELECT id, username, email FROM users WHERE tenant_id IS NULL AND (username = :u OR email = :e) AND deleted_at IS NULL",
+            {"u": payload.username, "e": payload.email}
+        )
     if existing:
+        field = "Username" if existing.get("username", "").lower() == payload.username.lower() else "Email"
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username or email is already registered."
+            detail=f"{field} is already registered in this tenant."
         )
 
+    import json
     pwd_hash = hash_password(payload.password)
     target_role = payload.role.upper()
+    modules_json = json.dumps(payload.allowed_modules or [])
 
     async def create_tx(session):
         from sqlalchemy.sql import text
@@ -126,8 +138,8 @@ async def create_user(
         # Insert user
         user_res = await session.execute(
             text("""
-            INSERT INTO users (tenant_id, username, email, password_hash, first_name, last_name)
-            VALUES (:t_id, :username, :email, :pwd_hash, :fn, :ln)
+            INSERT INTO users (tenant_id, username, email, password_hash, first_name, last_name, allowed_modules)
+            VALUES (:t_id, :username, :email, :pwd_hash, :fn, :ln, CAST(:modules AS jsonb))
             RETURNING id, created_at::text
             """),
             {
@@ -136,7 +148,8 @@ async def create_user(
                 "email": payload.email,
                 "pwd_hash": pwd_hash,
                 "fn": payload.first_name,
-                "ln": payload.last_name
+                "ln": payload.last_name,
+                "modules": modules_json
             }
         )
         user_row = user_res.fetchone()
@@ -171,6 +184,7 @@ async def create_user(
         "first_name": payload.first_name,
         "last_name": payload.last_name,
         "role": target_role,
+        "allowed_modules": payload.allowed_modules or [],
         "is_active": True,
         "created_at": created_at_str
     }
