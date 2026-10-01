@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:14-alpine
@@ -12,7 +10,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql
+      - ./migrations:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pbx_user -d pbx_db"]
       interval: 5s
@@ -60,6 +58,7 @@ services:
         condition: service_healthy
     volumes:
       - ./src:/app/src
+      - ./migrations:/app/migrations
       - recording_storage:/var/lib/freeswitch/recordings
 
   freeswitch:

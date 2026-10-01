@@ -8,6 +8,8 @@ from src.core.config import settings
 from src.core.database import engine, execute_query_one
 from src.core.redis import init_redis, close_redis, get_redis
 
+from src.core.migrator import run_migrations
+
 # Configure Structured Logger
 logging.basicConfig(
     level=logging.INFO if not settings.DEBUG else logging.DEBUG,
@@ -24,6 +26,9 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing Multi-Tenant PBX API Control Plane...")
     # Initialize Redis connection pool
     await init_redis()
+
+    # Automatically run pending database migrations
+    await run_migrations()
     
     yield
     
