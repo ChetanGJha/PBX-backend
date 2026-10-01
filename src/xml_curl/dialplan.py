@@ -36,8 +36,15 @@ def check_registered_domain(ext_num: str, candidate_domains: List[str]) -> Optio
         s.recv(1024)
         for dom in candidate_domains:
             s.sendall(f'api sofia_contact */{ext_num}@{dom}\n\n'.encode())
-            resp = s.recv(1024).decode()
-            if "error/user_not_registered" not in resp and "sofia/internal" in resp:
+            data = ""
+            while True:
+                chunk = s.recv(1024).decode('utf-8', errors='ignore')
+                if not chunk:
+                    break
+                data += chunk
+                if "error/user_not_registered" in data or "sofia/internal" in data:
+                    break
+            if "error/user_not_registered" not in data and "sofia/internal" in data:
                 s.close()
                 return dom
         s.close()
@@ -125,6 +132,44 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
         SubElement(cond_elem, "action", application="set", data="direction=internal")
         add_voicemail_block(cond_elem, target_ext_num, domain_name, tenant_id)
+        return format_xml(doc)
+
+    # Dedicated Forwarding Failover Destination (triggered via transfer_on_fail or no-answer transfer)
+    if dest_number.startswith("fwd_no_answer_"):
+        target_ext_num = dest_number.replace("fwd_no_answer_", "").strip()
+        logger.info(f"Handling failover forward on no-answer for extension: {target_ext_num}")
+
+        # Look up forwarding destination
+        cf_row = await execute_query_one(
+            """
+            SELECT cf.forward_no_answer_destination
+            FROM call_forwarding cf
+            JOIN extensions e ON cf.extension_id = e.id
+            WHERE e.tenant_id = CAST(:tid AS uuid) AND e.extension_number = :ext
+              AND cf.forward_no_answer_enabled = true
+            """,
+            {"tid": tenant_id, "ext": target_ext_num}
+        )
+        fwd_dest = cf_row.get("forward_no_answer_destination") if cf_row else None
+        if fwd_dest:
+            fwd_dest = str(fwd_dest).strip()
+            if "@" in fwd_dest:
+                fwd_dest = fwd_dest.split("@")[0].strip()
+
+        ext_elem = SubElement(context_elem, "extension", name=f"fwd_route_{target_ext_num}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="set", data="direction=internal")
+
+        # Avoid self-referential loop if forward destination is the target extension itself
+        if fwd_dest and fwd_dest != target_ext_num:
+            SubElement(cond_elem, "action", application="log", data=f"INFO Forwarding call for ext {target_ext_num} to {fwd_dest}")
+            SubElement(cond_elem, "action", application="set", data=f"transfer_on_fail=voicemail_{target_ext_num} XML {context}")
+            SubElement(cond_elem, "action", application="transfer", data=f"{fwd_dest} XML {context}")
+        else:
+            logger.info(f"Forward destination invalid or self-referential (fwd_dest={fwd_dest}, target={target_ext_num}). Routing to voicemail_{target_ext_num}")
+            add_voicemail_block(cond_elem, target_ext_num, domain_name, tenant_id)
+
         return format_xml(doc)
 
     # =========================================================================
@@ -411,10 +456,38 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         ext_num = target_ext["extension_number"]
         callee_domain = target_ext.get("sip_domain") or domain_name
 
-        # Configurable no-answer timeout (per extension or default 20s)
+        # Check Call Forwarding
+        cf_record = await execute_query_one(
+            """
+            SELECT forward_always_enabled, forward_always_destination,
+                   forward_busy_enabled, forward_busy_destination,
+                   forward_no_answer_enabled, forward_no_answer_destination,
+                   forward_no_answer_timeout
+            FROM call_forwarding
+            WHERE extension_id = CAST(:ext_id AS uuid)
+            """,
+            {"ext_id": str(target_ext["id"])}
+        )
+
+        has_fwd_no_answer = bool(cf_record and cf_record.get("forward_no_answer_enabled") and cf_record.get("forward_no_answer_destination"))
+        fwd_no_answer_dest = cf_record.get("forward_no_answer_destination", "").strip() if has_fwd_no_answer else ""
+        if "@" in fwd_no_answer_dest:
+            fwd_no_answer_dest = fwd_no_answer_dest.split("@")[0].strip()
+
+        # Configurable no-answer timeout:
+        # If call forwarding on no answer has a configured timeout, use it!
+        # Otherwise fallback to extension's no_answer_timeout, default 15s.
         timeout = target_ext.get("no_answer_timeout")
         if not timeout or not isinstance(timeout, int) or timeout <= 0:
             timeout = 15
+
+        if has_fwd_no_answer and cf_record.get("forward_no_answer_timeout"):
+            try:
+                cf_t = int(cf_record["forward_no_answer_timeout"])
+                if cf_t > 0:
+                    timeout = cf_t
+            except (ValueError, TypeError):
+                pass
 
         ext_elem = SubElement(context_elem, "extension", name=f"internal_ext_{ext_num}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=f"^{ext_num}$")
@@ -423,11 +496,11 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
         SubElement(cond_elem, "action", application="set", data="direction=internal")
 
-        # Ringing timeout variables
+        # Ringing timeout variables with ignore_early_media=true so timer counts while ringing
+        SubElement(cond_elem, "action", application="set", data="ignore_early_media=true")
         SubElement(cond_elem, "action", application="set", data=f"call_timeout={timeout}")
         SubElement(cond_elem, "action", application="set", data=f"originate_timeout={timeout}")
         SubElement(cond_elem, "action", application="set", data=f"leg_timeout={timeout}")
-        SubElement(cond_elem, "action", application="set", data=f"progress_timeout={timeout}")
         SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
         SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
         SubElement(cond_elem, "action", application="export", data="sip_contact_user=${destination_number}")
@@ -437,25 +510,16 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data=f"recording_file={rec_path}")
         SubElement(cond_elem, "action", application="set", data=f"execute_on_answer=record_session {rec_path}")
 
-        # Check Call Forwarding
-        cf_record = await execute_query_one(
-            """
-            SELECT forward_always_enabled, forward_always_destination,
-                   forward_busy_enabled, forward_busy_destination,
-                   forward_no_answer_enabled, forward_no_answer_destination
-            FROM call_forwarding
-            WHERE extension_id = CAST(:ext_id AS uuid)
-            """,
-            {"ext_id": str(target_ext["id"])}
-        )
-
-        has_fwd_no_answer = bool(cf_record and cf_record.get("forward_no_answer_enabled") and cf_record.get("forward_no_answer_destination"))
-        fwd_no_answer_dest = cf_record.get("forward_no_answer_destination", "").strip() if has_fwd_no_answer else ""
-
         # Failover target on no-answer or failure: forward target if enabled, else voicemail
-        fail_target = f"fwd_no_answer_{ext_num}" if has_fwd_no_answer else f"voicemail_{ext_num}"
+        # Prevent self-forwarding loop if target extension forwards to itself
+        if has_fwd_no_answer and fwd_no_answer_dest and fwd_no_answer_dest == ext_num:
+            logger.warning(f"Self-referential forward prevented: Extension {ext_num} cannot forward to itself. Falling back to voicemail.")
+            has_fwd_no_answer = False
+            fail_target = f"voicemail_{ext_num}"
+        else:
+            fail_target = f"fwd_no_answer_{ext_num}" if has_fwd_no_answer else f"voicemail_{ext_num}"
 
-        SubElement(cond_elem, "action", application="set", data="failure_causes=USER_BUSY,NO_ANSWER,CALL_REJECTED,ORIGINATOR_CANCEL,DESTINATION_OUT_OF_ORDER,NORMAL_TEMPORARY_FAILURE")
+        SubElement(cond_elem, "action", application="set", data="failure_causes=USER_BUSY,NO_ANSWER,CALL_REJECTED,ORIGINATOR_CANCEL,DESTINATION_OUT_OF_ORDER,NORMAL_TEMPORARY_FAILURE,TIMEOUT,ALLOTTED_TIMEOUT,PROGRESS_TIMEOUT")
         SubElement(cond_elem, "action", application="set", data=f"transfer_on_fail={fail_target} XML {context}")
         SubElement(cond_elem, "action", application="set", data="continue_on_fail=true")
 
@@ -469,8 +533,9 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             active_domain = check_registered_domain(ext_num, candidate_domains)
 
             if active_domain:
-                logger.info(f"Callee {ext_num} is actively registered on {active_domain}. Bridging...")
-                SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={timeout}]user/{ext_num}@{active_domain}")
+                logger.info(f"Callee {ext_num} is actively registered on {active_domain}. Bridging with timeout={timeout}s...")
+                bridge_opts = f"{{ignore_early_media=true,originate_timeout={timeout},call_timeout={timeout},leg_timeout={timeout}}}"
+                SubElement(cond_elem, "action", application="bridge", data=f"{bridge_opts}user/{ext_num}@{active_domain}")
                 SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
             else:
                 logger.info(f"Callee {ext_num} is offline (unregistered). Routing to failover target: {fail_target}.")

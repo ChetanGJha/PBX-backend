@@ -215,7 +215,7 @@ async def get_business_hours_details(
     if not row:
         raise HTTPException(status_code=404, detail="Business hours schedule not found")
 
-    if not current_user.is_super_admin and row["tenant_id"] != current_user.tenant_id:
+    if not current_user.is_super_admin and str(row["tenant_id"]) != str(current_user.tenant_id):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     holidays = await execute_query(
@@ -243,7 +243,7 @@ async def update_business_hours(
     if not existing:
         raise HTTPException(status_code=404, detail="Business hours schedule not found")
 
-    if not current_user.is_super_admin and existing["tenant_id"] != current_user.tenant_id:
+    if not current_user.is_super_admin and str(existing["tenant_id"]) != str(current_user.tenant_id):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     updates = []
@@ -298,7 +298,7 @@ async def delete_business_hours(
     if not existing:
         raise HTTPException(status_code=404, detail="Business hours schedule not found")
 
-    if not current_user.is_super_admin and existing["tenant_id"] != current_user.tenant_id:
+    if not current_user.is_super_admin and str(existing["tenant_id"]) != str(current_user.tenant_id):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     await execute_query_one(
@@ -352,7 +352,7 @@ async def add_holiday(
     if not bh:
         raise HTTPException(status_code=404, detail="Business hours schedule not found")
 
-    if not current_user.is_super_admin and bh["tenant_id"] != current_user.tenant_id:
+    if not current_user.is_super_admin and str(bh["tenant_id"]) != str(current_user.tenant_id):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     created = await execute_query_one(
@@ -388,7 +388,7 @@ async def delete_holiday(
     if not h:
         raise HTTPException(status_code=404, detail="Holiday entry not found")
 
-    if not current_user.is_super_admin and h["tenant_id"] != current_user.tenant_id:
+    if not current_user.is_super_admin and str(h["tenant_id"]) != str(current_user.tenant_id):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     await execute_query_one(

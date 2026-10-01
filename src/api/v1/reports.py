@@ -126,7 +126,7 @@ async def stream_call_recording(
     if not row:
         raise HTTPException(status_code=404, detail="Recording not found")
 
-    if not current_user.is_super_admin and row["tenant_id"] != current_user.tenant_id:
+    if not current_user.is_super_admin and row.get("tenant_id") and str(row["tenant_id"]) != str(current_user.tenant_id):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     file_path = row.get("file_path")
