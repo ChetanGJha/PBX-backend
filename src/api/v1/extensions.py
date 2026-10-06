@@ -92,15 +92,26 @@ async def create_extension(
             detail=f"Extension limit reached ({tenant['max_extensions']} max extensions allowed for this tenant)"
         )
 
-    # Check extension number uniqueness within tenant
-    existing = await execute_query_one(
+    # Check active extension number uniqueness within tenant
+    existing_active = await execute_query_one(
         "SELECT id FROM extensions WHERE tenant_id = :tenant_id AND extension_number = :num AND deleted_at IS NULL",
         {"tenant_id": target_tenant_id, "num": payload.extension_number}
     )
-    if existing:
+    if existing_active:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Extension number '{payload.extension_number}' already exists in this tenant"
+        )
+
+    # Check for soft-deleted extension with the same extension_number (to free up constraint)
+    existing_deleted = await execute_query_one(
+        "SELECT id FROM extensions WHERE tenant_id = :tenant_id AND extension_number = :num AND deleted_at IS NOT NULL",
+        {"tenant_id": target_tenant_id, "num": payload.extension_number}
+    )
+    if existing_deleted:
+        await execute_query_one(
+            "UPDATE extensions SET extension_number = extension_number || '_del_' || substr(md5(random()::text), 1, 6) WHERE id = :id",
+            {"id": existing_deleted["id"]}
         )
 
     query = """
@@ -117,20 +128,29 @@ async def create_extension(
         RETURNING id, tenant_id, extension_number, display_name, email, caller_id_name,
                   caller_id_number, outbound_caller_id, enabled, webrtc_enabled, no_answer_timeout, created_at
     """
-    row = await execute_query_one(query, {
-        "tenant_id": target_tenant_id,
-        "extension_number": payload.extension_number,
-        "display_name": payload.display_name,
-        "email": payload.email.strip() if payload.email and payload.email.strip() else None,
-        "sip_password": payload.sip_password,
-        "voicemail_pin": payload.voicemail_pin or "1234",
-        "caller_id_name": payload.caller_id_name or payload.display_name,
-        "caller_id_number": payload.caller_id_number or payload.extension_number,
-        "outbound_caller_id": payload.outbound_caller_id,
-        "emergency_caller_id": payload.emergency_caller_id,
-        "webrtc_enabled": payload.webrtc_enabled if payload.webrtc_enabled is not None else True,
-        "no_answer_timeout": payload.no_answer_timeout or 20
-    })
+    try:
+        row = await execute_query_one(query, {
+            "tenant_id": target_tenant_id,
+            "extension_number": payload.extension_number,
+            "display_name": payload.display_name,
+            "email": payload.email.strip() if payload.email and payload.email.strip() else None,
+            "sip_password": payload.sip_password,
+            "voicemail_pin": payload.voicemail_pin or "1234",
+            "caller_id_name": payload.caller_id_name or payload.display_name,
+            "caller_id_number": payload.caller_id_number or payload.extension_number,
+            "outbound_caller_id": payload.outbound_caller_id,
+            "emergency_caller_id": payload.emergency_caller_id,
+            "webrtc_enabled": payload.webrtc_enabled if payload.webrtc_enabled is not None else True,
+            "no_answer_timeout": payload.no_answer_timeout or 20
+        })
+    except Exception as exc:
+        err_str = str(exc)
+        if "extensions_tenant_id_extension_number_key" in err_str or "unique constraint" in err_str.lower() or "duplicate key" in err_str.lower():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Extension number '{payload.extension_number}' already exists in this tenant"
+            )
+        raise
 
     return dict(row)
 
@@ -354,7 +374,7 @@ async def delete_extension(
     validate_tenant_access(current_user, str(ext["tenant_id"]))
 
     await execute_query_one(
-        "UPDATE extensions SET deleted_at = NOW(), enabled = false WHERE id = :id",
+        "UPDATE extensions SET deleted_at = NOW(), enabled = false, extension_number = extension_number || '_del_' || substr(md5(random()::text), 1, 6) WHERE id = :id",
         {"id": extension_id}
     )
     return None
