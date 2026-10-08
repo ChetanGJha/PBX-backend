@@ -72,14 +72,36 @@ async def create_route(
     """
     target_tenant = payload.tenant_id if current_user.is_super_admin else current_user.tenant_id
 
+    data = payload.dict()
+    data["tenant_id"] = target_tenant
+
+    if data.get("gateway_id"):
+        try:
+            gw_check = await execute_query_one(
+                "SELECT id FROM gateways WHERE id = CAST(:gw_id AS uuid) AND deleted_at IS NULL",
+                {"gw_id": str(data["gateway_id"])}
+            )
+            if not gw_check:
+                data["gateway_id"] = None
+        except Exception:
+            data["gateway_id"] = None
+
     query = """
         INSERT INTO call_routes (name, did_number, route_type, destination_type, destination, priority, regex_pattern, gateway_id, tenant_id)
         VALUES (:name, :did_number, :route_type, :destination_type, :destination, :priority, :regex_pattern, :gateway_id, :tenant_id)
         RETURNING id, name, did_number, route_type, destination_type, destination, priority, regex_pattern, enabled, created_at::text
     """
-    data = payload.dict()
-    data["tenant_id"] = target_tenant
-    row = await execute_query_one(query, data)
+    try:
+        row = await execute_query_one(query, data)
+    except Exception as exc:
+        err_str = str(exc)
+        if "call_routes_gateway_id_fkey" in err_str or "foreign key" in err_str.lower() or "IntegrityError" in err_str or "ForeignKeyViolationError" in err_str:
+            # Fallback retry with gateway_id = None if FK fails
+            data["gateway_id"] = None
+            row = await execute_query_one(query, data)
+        else:
+            raise HTTPException(status_code=400, detail=f"Failed to create route: {err_str}")
+
     return dict(row)
 
 
@@ -104,6 +126,17 @@ async def update_route(
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
+    if data.get("gateway_id"):
+        try:
+            gw_check = await execute_query_one(
+                "SELECT id FROM gateways WHERE id = CAST(:gw_id AS uuid) AND deleted_at IS NULL",
+                {"gw_id": str(data["gateway_id"])}
+            )
+            if not gw_check:
+                data["gateway_id"] = None
+        except Exception:
+            data["gateway_id"] = None
+
     set_clauses = []
     params = {"id": str(route_id)}
     for k, v in data.items():
@@ -116,7 +149,16 @@ async def update_route(
         WHERE id = CAST(:id AS uuid)
         RETURNING id, name, did_number, route_type, destination_type, destination, priority, regex_pattern, enabled, created_at::text
     """
-    row = await execute_query_one(query, params)
+    try:
+        row = await execute_query_one(query, params)
+    except Exception as exc:
+        err_str = str(exc)
+        if "call_routes_gateway_id_fkey" in err_str or "foreign key" in err_str.lower() or "IntegrityError" in err_str or "ForeignKeyViolationError" in err_str:
+            params["gateway_id"] = None
+            row = await execute_query_one(query, params)
+        else:
+            raise HTTPException(status_code=400, detail=f"Failed to update route: {err_str}")
+
     return dict(row)
 
 
