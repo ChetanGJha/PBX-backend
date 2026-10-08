@@ -169,38 +169,40 @@ async def update_trunk(
     updates = []
     params = {"id": str(trunk_id)}
 
-    data = payload.dict(exclude_unset=True, exclude={"tenant_ids"})
+    data = payload.dict(exclude_unset=True, exclude={"tenant_ids", "tenant_id"})
     for field, val in data.items():
-        if field == "tenant_id":
-            if val is not None:
-                updates.append("tenant_id = CAST(:tenant_id AS uuid)")
-                params["tenant_id"] = str(val)
-            else:
-                updates.append("tenant_id = NULL")
-        else:
-            updates.append(f"{field} = :{field}")
-            params[field] = val
+        updates.append(f"{field} = :{field}")
+        params[field] = val
 
-    # Handle tenant_ids assignment
+    # Determine tenant assignment updates
+    assigned_tenants: Optional[List[UUID]] = None
     if payload.tenant_ids is not None:
+        assigned_tenants = payload.tenant_ids
+    elif "tenant_id" in payload.dict(exclude_unset=True):
+        if payload.tenant_id is not None:
+            assigned_tenants = [payload.tenant_id]
+        else:
+            assigned_tenants = []
+
+    if assigned_tenants is not None:
         # Clear existing assignments
         await execute_query(
             "DELETE FROM tenant_sip_trunks WHERE trunk_id = CAST(:trid AS uuid)",
             {"trid": str(trunk_id)}
         )
-        for tid in payload.tenant_ids:
+        for tid in assigned_tenants:
             await execute_query(
                 "INSERT INTO tenant_sip_trunks (tenant_id, trunk_id) VALUES (CAST(:tid AS uuid), CAST(:trid AS uuid)) ON CONFLICT DO NOTHING",
                 {"tid": str(tid), "trid": str(trunk_id)}
             )
         # Update legacy tenant_id field
-        if len(payload.tenant_ids) == 1:
+        if len(assigned_tenants) == 1:
             updates.append("tenant_id = CAST(:legacy_tid AS uuid)")
-            params["legacy_tid"] = str(payload.tenant_ids[0])
+            params["legacy_tid"] = str(assigned_tenants[0])
         else:
             updates.append("tenant_id = NULL")
 
-    if not updates and payload.tenant_ids is None:
+    if not updates and assigned_tenants is None:
         raise HTTPException(status_code=400, detail="No fields provided to update")
 
     if updates:
