@@ -446,3 +446,256 @@ async def stream_voicemail_audio(
         filename=os.path.basename(file_path),
         headers={"Accept-Ranges": "bytes"}
     )
+
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+
+def get_system_utilization():
+    cpu_pct = 0.0
+    mem_pct = 0.0
+    disk_pct = 0.0
+    if psutil:
+        try:
+            cpu_pct = psutil.cpu_percent(interval=0.05)
+            mem = psutil.virtual_memory()
+            mem_pct = mem.percent
+            disk = psutil.disk_usage('/')
+            disk_pct = disk.percent
+        except Exception as e:
+            logger.warning(f"Error reading psutil stats: {e}")
+
+    # Fallback for Memory % via /proc/meminfo
+    if mem_pct == 0.0:
+        try:
+            with open('/proc/meminfo', 'r') as f:
+                mem_info = {}
+                for line in f:
+                    parts = line.split(':')
+                    if len(parts) == 2:
+                        mem_info[parts[0].strip()] = int(parts[1].strip().split()[0])
+            total = mem_info.get('MemTotal', 0)
+            avail = mem_info.get('MemAvailable', mem_info.get('MemFree', 0) + mem_info.get('Buffers', 0) + mem_info.get('Cached', 0))
+            if total > 0:
+                mem_pct = round(((total - avail) / total) * 100, 1)
+        except Exception:
+            pass
+
+    # Fallback for CPU % via /proc/stat
+    if cpu_pct == 0.0:
+        try:
+            with open('/proc/stat', 'r') as f:
+                line = f.readline()
+            fields = [float(x) for x in line.split()[1:]]
+            idle_time = fields[3] + fields[4]
+            total_time = sum(fields)
+            if total_time > 0:
+                cpu_pct = round((1.0 - (idle_time / total_time)) * 100, 1)
+        except Exception:
+            pass
+
+    # Fallback for Disk % via shutil
+    if disk_pct == 0.0:
+        try:
+            import shutil
+            total, used, free = shutil.disk_usage("/")
+            disk_pct = round((used / total) * 100, 1)
+        except Exception:
+            pass
+
+    return {
+        "cpu_percent": round(cpu_pct, 1),
+        "memory_percent": round(mem_pct, 1),
+        "disk_percent": round(disk_pct, 1)
+    }
+
+
+@router.get("/dashboard-metrics")
+async def get_dashboard_metrics(
+    tenant_id: Optional[UUID] = None,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Get profile-specific dashboard metrics including System Utilization, Live Calls,
+    counts, Traffic Summary (inbound/outbound answered/unanswered/failed), and Traffic Peak.
+    """
+    target_tenant = tenant_id if current_user.is_super_admin and tenant_id else current_user.tenant_id
+
+    sys_util = get_system_utilization()
+
+    # 1. Counts
+    tenants_count = 0
+    carriers_count = 0
+    if current_user.is_super_admin:
+        t_row = await execute_query_one("SELECT COUNT(*) as cnt FROM tenants WHERE deleted_at IS NULL")
+        tenants_count = t_row["cnt"] if t_row else 0
+        gw_row = await execute_query_one("SELECT COUNT(*) as cnt FROM gateways WHERE deleted_at IS NULL")
+        tr_row = await execute_query_one("SELECT COUNT(*) as cnt FROM sip_trunks WHERE deleted_at IS NULL")
+        carriers_count = (gw_row["cnt"] if gw_row else 0) + (tr_row["cnt"] if tr_row else 0)
+
+    ext_query = "SELECT COUNT(*) as cnt FROM extensions WHERE deleted_at IS NULL"
+    ext_params = {}
+    if target_tenant:
+        ext_query += " AND tenant_id = CAST(:t_id AS uuid)"
+        ext_params["t_id"] = str(target_tenant)
+    ext_row = await execute_query_one(ext_query, ext_params)
+    ext_count = ext_row["cnt"] if ext_row else 0
+
+    did_query = "SELECT COUNT(*) as cnt FROM dids WHERE deleted_at IS NULL"
+    did_params = {}
+    if target_tenant:
+        did_query += " AND tenant_id = CAST(:t_id AS uuid)"
+        did_params["t_id"] = str(target_tenant)
+    did_row = await execute_query_one(did_query, did_params)
+    did_count = did_row["cnt"] if did_row else 0
+
+    q_query = "SELECT COUNT(*) as cnt FROM queues WHERE deleted_at IS NULL"
+    q_params = {}
+    if target_tenant:
+        q_query += " AND tenant_id = CAST(:t_id AS uuid)"
+        q_params["t_id"] = str(target_tenant)
+    q_row = await execute_query_one(q_query, q_params)
+    q_count = q_row["cnt"] if q_row else 0
+
+    ivr_query = "SELECT COUNT(*) as cnt FROM ivr_menus WHERE deleted_at IS NULL"
+    ivr_params = {}
+    if target_tenant:
+        ivr_query += " AND tenant_id = CAST(:t_id AS uuid)"
+        ivr_params["t_id"] = str(target_tenant)
+    ivr_row = await execute_query_one(ivr_query, ivr_params)
+    ivr_count = ivr_row["cnt"] if ivr_row else 0
+
+    # 2. Live Calls
+    live_query = "SELECT COUNT(*) as cnt FROM cdr WHERE answer_time IS NOT NULL AND end_time IS NULL"
+    live_params = {}
+    if target_tenant:
+        live_query += " AND tenant_id = CAST(:t_id AS uuid)"
+        live_params["t_id"] = str(target_tenant)
+    live_row = await execute_query_one(live_query, live_params)
+    live_calls = live_row["cnt"] if live_row else 0
+
+    # 3. Traffic Summary
+    traffic_query = """
+        SELECT 
+            COUNT(*) FILTER (WHERE direction = 'inbound') as in_total,
+            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec > 0) as in_answered,
+            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND hangup_cause IN ('NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE')) as in_unanswered,
+            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE'))) as in_failed,
+
+            COUNT(*) FILTER (WHERE direction = 'outbound' OR LENGTH(destination) > 6) as out_total,
+            COUNT(*) FILTER (WHERE (direction = 'outbound' OR LENGTH(destination) > 6) AND billsec > 0) as out_answered,
+            COUNT(*) FILTER (WHERE (direction = 'outbound' OR LENGTH(destination) > 6) AND billsec = 0 AND hangup_cause IN ('NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE')) as out_unanswered,
+            COUNT(*) FILTER (WHERE (direction = 'outbound' OR LENGTH(destination) > 6) AND billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE'))) as out_failed
+        FROM cdr
+        WHERE 1=1
+    """
+    traffic_params = {}
+    if target_tenant:
+        traffic_query += " AND tenant_id = CAST(:t_id AS uuid)"
+        traffic_params["t_id"] = str(target_tenant)
+    t_sum_row = await execute_query_one(traffic_query, traffic_params)
+
+    traffic_summary = {
+        "inbound": {
+            "total": t_sum_row["in_total"] if t_sum_row else 0,
+            "answered": t_sum_row["in_answered"] if t_sum_row else 0,
+            "unanswered": t_sum_row["in_unanswered"] if t_sum_row else 0,
+            "failed": t_sum_row["in_failed"] if t_sum_row else 0
+        },
+        "outbound": {
+            "total": t_sum_row["out_total"] if t_sum_row else 0,
+            "answered": t_sum_row["out_answered"] if t_sum_row else 0,
+            "unanswered": t_sum_row["out_unanswered"] if t_sum_row else 0,
+            "failed": t_sum_row["out_failed"] if t_sum_row else 0
+        }
+    }
+
+    # 4. Traffic Peak (Max calls per 1-hour window)
+    peak_query = """
+        SELECT 
+            COALESCE(MAX(in_cnt), 0) as inbound_peak,
+            COALESCE(MAX(out_cnt), 0) as outbound_peak
+        FROM (
+            SELECT 
+                date_trunc('hour', start_time) as hr,
+                COUNT(*) FILTER (WHERE direction = 'inbound') as in_cnt,
+                COUNT(*) FILTER (WHERE direction = 'outbound' OR LENGTH(destination) > 6) as out_cnt
+            FROM cdr
+            WHERE start_time >= NOW() - INTERVAL '30 days'
+    """
+    peak_params = {}
+    if target_tenant:
+        peak_query += " AND tenant_id = CAST(:t_id AS uuid)"
+        peak_params["t_id"] = str(target_tenant)
+    peak_query += " GROUP BY date_trunc('hour', start_time)) hourly"
+    peak_row = await execute_query_one(peak_query, peak_params)
+
+    traffic_peak = {
+        "inbound_peak": peak_row["inbound_peak"] if peak_row else 0,
+        "outbound_peak": peak_row["outbound_peak"] if peak_row else 0
+    }
+
+    return {
+        "system_utilization": sys_util,
+        "counts": {
+            "tenants": tenants_count,
+            "carriers": carriers_count,
+            "extensions": ext_count,
+            "dids": did_count,
+            "queues_and_ivrs": q_count + ivr_count
+        },
+        "live_calls": live_calls,
+        "traffic_summary": traffic_summary,
+        "traffic_peak": traffic_peak
+    }
+
+
+@router.get("/tenant-summary")
+async def get_tenant_summary_report(
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Summarized Reports traffic wise (inbound & outbound) tenant wise.
+    """
+    target_tenant = None if current_user.is_super_admin else current_user.tenant_id
+
+    query = """
+        SELECT 
+            COALESCE(t.id::text, 'global') as tenant_id,
+            COALESCE(t.name, 'Global Domain') as tenant_name,
+            COALESCE(t.domain, 'global') as tenant_domain,
+            COUNT(*) as total_calls,
+            COALESCE(SUM(c.duration), 0) as total_duration_sec,
+            COALESCE(SUM(c.billsec), 0) as total_billsec,
+            COUNT(*) FILTER (WHERE c.direction = 'inbound') as inbound_calls,
+            COALESCE(SUM(c.duration) FILTER (WHERE c.direction = 'inbound'), 0) as inbound_duration_sec,
+            COUNT(*) FILTER (WHERE c.direction = 'outbound' OR LENGTH(c.destination) > 6) as outbound_calls,
+            COUNT(*) FILTER (WHERE (c.direction = 'outbound' OR LENGTH(c.destination) > 6) AND c.billsec > 0) as outbound_answered,
+            COUNT(*) FILTER (WHERE (c.direction = 'outbound' OR LENGTH(c.destination) > 6) AND c.billsec = 0 AND (c.hangup_cause IS NULL OR c.hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE'))) as outbound_failed,
+            COALESCE(SUM(c.duration) FILTER (WHERE c.direction = 'outbound' OR LENGTH(c.destination) > 6), 0) as outbound_duration_sec
+        FROM cdr c
+        LEFT JOIN tenants t ON c.tenant_id = t.id
+        WHERE 1=1
+    """
+    params = {}
+    if target_tenant:
+        query += " AND c.tenant_id = CAST(:t_id AS uuid)"
+        params["t_id"] = str(target_tenant)
+    if start_date:
+        query += " AND c.start_time >= CAST(:start_date AS timestamptz)"
+        params["start_date"] = f"{start_date} 00:00:00"
+    if end_date:
+        query += " AND c.start_time <= CAST(:end_date AS timestamptz)"
+        params["end_date"] = f"{end_date} 23:59:59"
+
+    query += """
+        GROUP BY t.id, t.name, t.domain
+        ORDER BY total_calls DESC
+    """
+    rows = await execute_query(query, params)
+    return [dict(r) for r in rows]
