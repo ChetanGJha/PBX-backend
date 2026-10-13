@@ -59,6 +59,7 @@ services:
     volumes:
       - ./src:/app/src
       - ./migrations:/app/migrations
+      - ./config/freeswitch:/etc/freeswitch
       - recording_storage:/var/lib/freeswitch/recordings
 
   freeswitch:
@@ -75,6 +76,8 @@ services:
       - "7443:7443/tcp"
       - "5080:5080/tcp"
       - "5080:5080/udp"
+      - "5090:5090/tcp"
+      - "5090:5090/udp"
       - "8021:8021/tcp"
       - "16384-16484:16384-16484/udp"
     volumes:

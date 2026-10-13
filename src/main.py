@@ -30,6 +30,13 @@ async def lifespan(app: FastAPI):
     # Automatically run pending database migrations
     await run_migrations()
     
+    # Synchronize configured Sofia Gateways with FreeSWITCH
+    try:
+        from src.services.gateway_sync import sync_gateways_to_freeswitch
+        await sync_gateways_to_freeswitch()
+    except Exception as e:
+        logger.warning(f"Initial gateway sync warning: {e}")
+    
     yield
     
     logger.info("Shutting down Multi-Tenant PBX API Control Plane...")

@@ -2,7 +2,8 @@
   <aliases>
     <alias name="pbx.aikyamlabs.local"/>
     <alias name="127.0.0.1"/>
-    <alias name="172.16.0.179"/>
+    <alias name="8.234.117.15"/>
+    <alias name="10.0.0.128"/>
   </aliases>
   <settings>
     <param name="debug" value="0"/>
