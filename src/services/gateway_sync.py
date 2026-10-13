@@ -2,6 +2,7 @@ import os
 import re
 import socket
 import logging
+import asyncio
 from typing import Dict, Any, List, Optional
 from src.core.config import settings
 from src.core.database import execute_query
@@ -38,16 +39,18 @@ def sanitize_filename(name: str) -> str:
 def determine_gateway_profile(gw: Dict[str, Any]) -> str:
     """
     Determines whether the gateway belongs to:
-    - 'external-crossconnect': for Fixed Line series SBC (Private Cross Connect on 10.50.185.x, No NAT)
-    - 'external': for ITS SBC (GCP Public NAT 8.234.117.15)
+    - 'external-crossconnect': for Fixed Line series SBC (e.g. ISHAN_FL, 10.50.185.x, Cross Connect, No NAT)
+    - 'external': for ITS SBC (e.g. ISHAN_ITS, GCP Public NAT 8.234.117.15)
     """
     explicit_profile = (gw.get("profile") or "").strip().lower()
     if explicit_profile in ("external-crossconnect", "crossconnect", "fixedline"):
         return "external-crossconnect"
     
-    proxy = (gw.get("proxy") or "").strip()
-    # Check if proxy matches the Cross Connect subnet 10.50.185.x
-    if proxy.startswith("10.50.185.") or proxy.startswith("10.50."):
+    name = (gw.get("name") or "").strip().lower()
+    proxy = (gw.get("proxy") or gw.get("host") or "").strip()
+
+    # If trunk name contains '_fl' or 'fixedline' or proxy matches crossconnect
+    if "_fl" in name or "fixedline" in name or "crossconnect" in name or proxy.startswith("10.50.185.") or proxy.startswith("10.50."):
         return "external-crossconnect"
         
     return "external"
@@ -58,14 +61,20 @@ def render_gateway_xml(gw: Dict[str, Any]) -> str:
     Generates FreeSWITCH Sofia Gateway XML definition.
     """
     gw_name = gw.get("name") or "unnamed_gateway"
-    proxy = gw.get("proxy") or "127.0.0.1"
-    realm = gw.get("realm") or proxy
+    proxy = gw.get("proxy") or gw.get("host") or "127.0.0.1"
+    port = gw.get("port")
+    if port and port != 5060 and ":" not in str(proxy):
+        proxy = f"{proxy}:{port}"
+
+    realm = gw.get("realm") or gw.get("proxy") or gw.get("host") or proxy
     username = gw.get("username") or gw_name
     password = gw.get("password") or "nopassword"
-    register = "true" if gw.get("register") and gw.get("username") else "false"
+    register = "true" if gw.get("register") and gw.get("username") and gw.get("username") != "IP Auth" else "false"
     from_user = gw.get("username") or gw_name
+    if from_user == "IP Auth":
+        from_user = gw_name
     from_domain = gw.get("from_domain") or realm or proxy
-    caller_id_in_from = "true" if gw.get("caller_id_in_from") else "false"
+    caller_id_in_from = "true" if gw.get("caller_id_in_from", True) else "false"
     codecs = gw.get("codecs") or "PCMU,PCMA,G722"
 
     xml_lines = [
@@ -135,8 +144,8 @@ def execute_esl_command(command: str) -> Optional[str]:
 
 async def sync_gateways_to_freeswitch() -> Dict[str, Any]:
     """
-    Synchronizes all enabled Sofia gateways from PostgreSQL into FreeSWITCH XML files,
-    removes obsolete XMLs, and rescans both 'external' and 'external-crossconnect' profiles.
+    Synchronizes all Sofia gateways (from both 'gateways' and 'sip_trunks' tables)
+    into FreeSWITCH XML files, removes obsolete XMLs, and rescans Sofia profiles.
     """
     base_dir = get_sip_profiles_base_dir()
     ext_dir = os.path.join(base_dir, "external")
@@ -145,66 +154,109 @@ async def sync_gateways_to_freeswitch() -> Dict[str, Any]:
     os.makedirs(ext_dir, exist_ok=True)
     os.makedirs(cross_dir, exist_ok=True)
 
-    # 1. Fetch all active gateways from DB
-    query = """
-        SELECT id, name, proxy, username, password, realm, from_domain, codecs,
-               tenant_id, register, caller_id_in_from, enabled, profile
-        FROM gateways
-        WHERE deleted_at IS NULL AND enabled = true
-        ORDER BY name ASC
-    """
-    rows = await execute_query(query)
-    active_gws = [dict(r) for r in rows]
+    active_items: Dict[str, Dict[str, Any]] = {}
+
+    # 1. Fetch all active gateways from 'gateways' table
+    try:
+        gw_query = """
+            SELECT id, name, proxy, username, password, realm, from_domain, codecs,
+                   tenant_id, register, caller_id_in_from, enabled, profile
+            FROM gateways
+            WHERE deleted_at IS NULL AND enabled = true
+            ORDER BY name ASC
+        """
+        gw_rows = await execute_query(gw_query)
+        for r in gw_rows:
+            d = dict(r)
+            active_items[d["name"]] = d
+    except Exception as e:
+        logger.warning(f"Error querying gateways table: {e}")
+
+    # 2. Fetch all active trunks from 'sip_trunks' table (e.g. ISHAN_FL, ISHAN_ITS)
+    try:
+        trunk_query = """
+            SELECT id, name, host as proxy, username, password, realm, port, priority,
+                   tenant_id, register, enabled
+            FROM sip_trunks
+            WHERE deleted_at IS NULL AND enabled = true
+            ORDER BY priority ASC, name ASC
+        """
+        trunk_rows = await execute_query(trunk_query)
+        for r in trunk_rows:
+            d = dict(r)
+            name = d["name"]
+            if name not in active_items:
+                # Add default codecs and caller_id_in_from for sip_trunks
+                d["codecs"] = "PCMU,PCMA,G722"
+                d["caller_id_in_from"] = True
+                active_items[name] = d
+    except Exception as e:
+        logger.warning(f"Error querying sip_trunks table: {e}")
 
     synced_files = {"external": set(), "external-crossconnect": set()}
     written_count = 0
 
-    # 2. Write gateway XML files
-    for gw in active_gws:
-        profile_type = determine_gateway_profile(gw)
-        gw_filename = f"{sanitize_filename(gw['name'])}.xml"
+    # 3. Write gateway XML files
+    for name, item in active_items.items():
+        profile_type = determine_gateway_profile(item)
+        gw_filename = f"{sanitize_filename(name)}.xml"
         target_dir = cross_dir if profile_type == "external-crossconnect" else ext_dir
         target_path = os.path.join(target_dir, gw_filename)
 
-        xml_content = render_gateway_xml(gw)
+        xml_content = render_gateway_xml(item)
         try:
             with open(target_path, "w", encoding="utf-8") as f:
                 f.write(xml_content)
             synced_files[profile_type].add(gw_filename)
             written_count += 1
-            logger.info(f"Wrote gateway XML: {target_path} for profile '{profile_type}'")
+            logger.info(f"Wrote gateway XML: {target_path} for profile '{profile_type}' (name='{name}')")
         except Exception as e:
             logger.error(f"Failed writing gateway XML file {target_path}: {e}")
 
-    # 3. Clean up stale gateway XML files
+    # 4. Clean up stale gateway XML files
     deleted_count = 0
     for profile_type, p_dir in [("external", ext_dir), ("external-crossconnect", cross_dir)]:
         try:
             for f in os.listdir(p_dir):
                 if f.endswith(".xml") and f not in synced_files[profile_type]:
                     dead_path = os.path.join(p_dir, f)
-                    os.remove(dead_path)
-                    deleted_count += 1
-                    gw_raw_name = f[:-4]
-                    execute_esl_command(f"sofia profile {profile_type} killgw {gw_raw_name}")
-                    logger.info(f"Removed stale gateway XML: {dead_path}")
+                    try:
+                        os.remove(dead_path)
+                        deleted_count += 1
+                        gw_raw_name = f[:-4]
+                        execute_esl_command(f"sofia profile {profile_type} killgw {gw_raw_name}")
+                        logger.info(f"Removed stale gateway XML: {dead_path}")
+                    except Exception as err:
+                        logger.warning(f"Error removing file {dead_path}: {err}")
         except Exception as e:
             logger.warning(f"Error checking stale XML files in {p_dir}: {e}")
 
-    # 4. Trigger FreeSWITCH XML reload and Sofia rescans
+    # 5. Trigger FreeSWITCH XML reload and Sofia rescans
     execute_esl_command("reloadxml")
     execute_esl_command("sofia profile external rescan")
     execute_esl_command("sofia profile external-crossconnect rescan")
 
-    # 5. Fetch sofia status for verification
+    # 6. Fetch sofia status for verification
     status_output = execute_esl_command("sofia status") or ""
 
     return {
         "success": True,
-        "total_active_gateways": len(active_gws),
+        "total_active_gateways": len(active_items),
         "written_files": written_count,
         "deleted_files": deleted_count,
         "external_gateways": list(synced_files["external"]),
         "crossconnect_gateways": list(synced_files["external-crossconnect"]),
         "sofia_status_summary": status_output.strip()
     }
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    res = asyncio.run(sync_gateways_to_freeswitch())
+    print("\n--- GATEWAY SYNC RESULT ---")
+    print("Success:", res["success"])
+    print("Total active:", res["total_active_gateways"])
+    print("External Gateways:", res["external_gateways"])
+    print("CrossConnect Gateways:", res["crossconnect_gateways"])
+    print("\nSofia Status Output:")
+    print(res["sofia_status_summary"])

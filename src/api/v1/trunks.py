@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 from src.core.database import execute_query, execute_query_one
 from src.core.permissions import get_current_user, require_roles, CurrentUser
+from src.services.gateway_sync import sync_gateways_to_freeswitch
 
 router = APIRouter(prefix="/trunks", tags=["SIP Trunks"])
 
@@ -147,6 +148,13 @@ async def create_trunk(
 
     res = dict(row)
     res["tenant_ids"] = [str(t) for t in assigned_tenants]
+
+    # Automatically generate FreeSWITCH XML gateway and rescan
+    try:
+        await sync_gateways_to_freeswitch()
+    except Exception:
+        pass
+
     return res
 
 
@@ -226,6 +234,12 @@ async def update_trunk(
     )
     res = dict(row)
     res["tenant_ids"] = [r["tenant_id"] for r in t_rows]
+
+    try:
+        await sync_gateways_to_freeswitch()
+    except Exception:
+        pass
+
     return res
 
 
@@ -239,4 +253,20 @@ async def delete_trunk(
     """
     await execute_query("UPDATE sip_trunks SET deleted_at = NOW(), enabled = false WHERE id = CAST(:id AS uuid)", {"id": str(trunk_id)})
     await execute_query("DELETE FROM tenant_sip_trunks WHERE trunk_id = CAST(:id AS uuid)", {"id": str(trunk_id)})
+    
+    try:
+        await sync_gateways_to_freeswitch()
+    except Exception:
+        pass
+
     return None
+
+
+@router.post("/sync")
+async def trigger_trunk_sync(
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
+):
+    """
+    Trigger immediate synchronization of all SIP trunks and Sofia gateways to FreeSWITCH.
+    """
+    return await sync_gateways_to_freeswitch()
