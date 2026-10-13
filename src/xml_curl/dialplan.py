@@ -573,25 +573,75 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         # Strip dialing prefix 9 if present
         dialed_digits = dest_number[1:] if dest_number.startswith("9") else dest_number
 
-        # Check for assigned dedicated trunk (via tenant_sip_trunks or legacy tenant_id) or global shared trunk (0 tenants assigned)
-        trunk = await execute_query_one(
-            """
-            SELECT t.name, t.host, t.port FROM sip_trunks t
-            LEFT JOIN tenant_sip_trunks tst ON t.id = tst.trunk_id
-            WHERE (
-                tst.tenant_id = CAST(:tid AS uuid)
-                OR t.tenant_id = CAST(:tid AS uuid)
-                OR (
-                    NOT EXISTS (SELECT 1 FROM tenant_sip_trunks WHERE trunk_id = t.id)
-                    AND t.tenant_id IS NULL
-                )
+        # 1. Check for gateway assigned to tenant via tenant_gateways or gateways.tenant_id or shared gateway
+        assigned_gw = None
+        if tenant_id:
+            assigned_gw = await execute_query_one(
+                """
+                SELECT g.name, tg.priority, tg.allow_international, tg.caller_id_policy
+                FROM tenant_gateways tg
+                JOIN gateways g ON tg.gateway_id = g.id
+                WHERE tg.tenant_id = CAST(:tid AS uuid)
+                  AND tg.allow_outbound = true
+                  AND tg.direction IN ('inbound_outbound', 'outbound_only')
+                  AND g.enabled = true
+                  AND g.deleted_at IS NULL
+                ORDER BY tg.priority ASC, g.name ASC
+                LIMIT 1
+                """,
+                {"tid": tenant_id}
             )
-            AND t.enabled = true AND t.deleted_at IS NULL
-            ORDER BY (tst.tenant_id IS NOT NULL OR t.tenant_id IS NOT NULL) DESC, t.priority ASC LIMIT 1
-            """,
-            {"tid": tenant_id}
-        )
-        trunk_name = trunk["name"] if trunk else "tata"
+            if not assigned_gw:
+                assigned_gw = await execute_query_one(
+                    """
+                    SELECT g.name
+                    FROM gateways g
+                    WHERE g.tenant_id = CAST(:tid AS uuid)
+                      AND g.enabled = true
+                      AND g.deleted_at IS NULL
+                    ORDER BY g.name ASC
+                    LIMIT 1
+                    """,
+                    {"tid": tenant_id}
+                )
+
+        if not assigned_gw:
+            # Check for global shared gateway
+            assigned_gw = await execute_query_one(
+                """
+                SELECT g.name
+                FROM gateways g
+                WHERE g.tenant_id IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM tenant_gateways tg WHERE tg.gateway_id = g.id)
+                  AND g.enabled = true
+                  AND g.deleted_at IS NULL
+                ORDER BY g.name ASC
+                LIMIT 1
+                """
+            )
+
+        if assigned_gw:
+            outbound_gateway_name = assigned_gw["name"]
+        else:
+            # Fallback to sip_trunks
+            trunk = await execute_query_one(
+                """
+                SELECT t.name, t.host, t.port FROM sip_trunks t
+                LEFT JOIN tenant_sip_trunks tst ON t.id = tst.trunk_id
+                WHERE (
+                    tst.tenant_id = CAST(:tid AS uuid)
+                    OR t.tenant_id = CAST(:tid AS uuid)
+                    OR (
+                        NOT EXISTS (SELECT 1 FROM tenant_sip_trunks WHERE trunk_id = t.id)
+                        AND t.tenant_id IS NULL
+                    )
+                )
+                AND t.enabled = true AND t.deleted_at IS NULL
+                ORDER BY (tst.tenant_id IS NOT NULL OR t.tenant_id IS NOT NULL) DESC, t.priority ASC LIMIT 1
+                """,
+                {"tid": tenant_id}
+            )
+            outbound_gateway_name = trunk["name"] if trunk else "tata"
 
         ext_elem = SubElement(context_elem, "extension", name=f"outbound_{dest_number}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
@@ -612,7 +662,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="effective_caller_id_number=${outbound_caller_id_number}")
 
         # Attempt bridge through gateway
-        SubElement(cond_elem, "action", application="bridge", data=f"sofia/gateway/{trunk_name}/{dialed_digits}")
+        SubElement(cond_elem, "action", application="bridge", data=f"sofia/gateway/{outbound_gateway_name}/{dialed_digits}")
 
         # Interactive Outbound Carrier Simulation Fallback (for testing without live PSTN provider)
         SubElement(cond_elem, "action", application="answer")

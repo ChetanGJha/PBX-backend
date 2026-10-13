@@ -10,6 +10,7 @@ from src.xml_curl.directory import handle_directory_request
 from src.xml_curl.dialplan import handle_dialplan_request
 from src.core.database import execute_query_one, execute_query
 from src.core.email_service import send_voicemail_notification
+from src.services.gateway_sync import generate_sofia_conf_xml
 
 logger = logging.getLogger("pbx.xml_curl.router")
 
@@ -106,7 +107,18 @@ async def handle_xml_curl(request: Request):
             xml_response = await handle_dialplan_request(form_dict)
             return Response(content=xml_response, media_type="text/xml")
         elif section == "configuration":
-            if key_value == "json_cdr.conf":
+            if key_value in ("sofia.conf", "sofia.conf.xml"):
+                gw_rows = await execute_query(
+                    """
+                    SELECT name, proxy, username, password, realm, from_domain, codecs, register, caller_id_in_from
+                    FROM gateways
+                    WHERE enabled = true AND deleted_at IS NULL
+                    ORDER BY name ASC
+                    """
+                )
+                sofia_xml = generate_sofia_conf_xml([dict(r) for r in gw_rows])
+                return Response(content=sofia_xml, media_type="text/xml")
+            elif key_value == "json_cdr.conf":
                 return Response(content=JSON_CDR_CONF_XML, media_type="text/xml")
             elif key_value == "voicemail.conf":
                 return Response(content=VOICEMAIL_CONF_XML, media_type="text/xml")

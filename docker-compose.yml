@@ -59,6 +59,7 @@ services:
     volumes:
       - ./src:/app/src
       - ./migrations:/app/migrations
+      - ./config/freeswitch:/etc/freeswitch
       - recording_storage:/var/lib/freeswitch/recordings
 
   freeswitch:
