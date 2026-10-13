@@ -398,43 +398,71 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         add_voicemail_block(cond_elem, fallback_ext, domain_name, hg_tenant_id)
         return format_xml(doc)
 
-    # Check Database DIDs & Call Routes
-    if tenant_id:
-        did_route = await execute_query_one(
+    # Check Inbound Database Call Routes & DIDs (globally or for tenant)
+    inbound_route = await execute_query_one(
+        """
+        SELECT cr.id, cr.destination_type, cr.destination, cr.tenant_id, t.sip_domain
+        FROM call_routes cr
+        LEFT JOIN tenants t ON cr.tenant_id = t.id
+        WHERE (
+            cr.did_number = :dest 
+            OR cr.did_number = '+' || :dest 
+            OR cr.did_number = TRIM(LEADING '+' FROM :dest)
+            OR :dest LIKE '%' || cr.did_number
+        )
+        AND cr.route_type = 'inbound_did' AND cr.enabled = true AND cr.deleted_at IS NULL
+        ORDER BY cr.priority ASC LIMIT 1
+        """,
+        {"dest": dest_number}
+    )
+    if not inbound_route:
+        inbound_route = await execute_query_one(
             """
-            SELECT destination_type, destination_target, destination
-            FROM dids
-            WHERE (did_number = :dest OR did_number = '+' || :dest) AND enabled = true AND deleted_at IS NULL
+            SELECT d.id, d.destination_type, COALESCE(d.destination_target, d.destination) as destination, d.tenant_id, t.sip_domain
+            FROM dids d
+            LEFT JOIN tenants t ON d.tenant_id = t.id
+            WHERE (
+                d.did_number = :dest 
+                OR d.did_number = '+' || :dest 
+                OR d.did_number = TRIM(LEADING '+' FROM :dest)
+                OR :dest LIKE '%' || d.did_number
+            )
+            AND d.enabled = true AND d.deleted_at IS NULL
             LIMIT 1
             """,
             {"dest": dest_number}
         )
-        if did_route:
-            dest_type = did_route.get("destination_type") or "extension"
-            target = did_route.get("destination_target") or did_route.get("destination") or "1001"
-            ext_elem = SubElement(context_elem, "extension", name=f"did_{dest_number}")
-            cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-            SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
-            SubElement(cond_elem, "action", application="set", data="direction=inbound")
-            SubElement(cond_elem, "action", application="set", data=f"did={dest_number}")
-            SubElement(cond_elem, "action", application="set", data="hangup_after_bridge=true")
-            SubElement(cond_elem, "action", application="export", data="hangup_after_bridge=true")
-            SubElement(cond_elem, "action", application="set", data=f"continue_on_fail={VOICEMAIL_CONTINUE_ON_FAIL}")
-            SubElement(cond_elem, "action", application="set", data=f"recording_file=/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
-            SubElement(cond_elem, "action", application="record_session", data=f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
-            SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
-            SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
 
-            if dest_type == "extension":
-                SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/{target}@{domain_name}")
-                add_voicemail_block(cond_elem, target, domain_name, tenant_id)
-            elif dest_type == "queue":
-                SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/1001@{domain_name},user/1002@{domain_name}")
-            elif dest_type == "hunt_group":
-                SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/1001@{domain_name},user/1002@{domain_name}")
-            elif dest_type == "ivr":
-                SubElement(cond_elem, "action", application="transfer", data=f"{target or '6001'} XML {context}")
-            return format_xml(doc)
+    if inbound_route:
+        tenant_id = str(inbound_route.get("tenant_id") or tenant_id or "")
+        domain_name = inbound_route.get("sip_domain") or domain_name
+        dest_type = inbound_route.get("destination_type") or "extension"
+        target = inbound_route.get("destination") or "1001"
+        ext_elem = SubElement(context_elem, "extension", name=f"did_{dest_number}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="set", data="direction=inbound")
+        SubElement(cond_elem, "action", application="set", data=f"did={dest_number}")
+        SubElement(cond_elem, "action", application="set", data="hangup_after_bridge=true")
+        SubElement(cond_elem, "action", application="export", data="hangup_after_bridge=true")
+        SubElement(cond_elem, "action", application="set", data=f"continue_on_fail={VOICEMAIL_CONTINUE_ON_FAIL}")
+        SubElement(cond_elem, "action", application="set", data=f"recording_file=/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
+        SubElement(cond_elem, "action", application="record_session", data=f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
+        SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
+        SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
+
+        if dest_type == "extension":
+            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/{target}@{domain_name}")
+            add_voicemail_block(cond_elem, target, domain_name, tenant_id)
+        elif dest_type == "queue":
+            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/1001@{domain_name},user/1002@{domain_name}")
+        elif dest_type == "hunt_group":
+            SubElement(cond_elem, "action", application="transfer", data=f"{target or '8888'} XML {context}")
+        elif dest_type == "ivr":
+            SubElement(cond_elem, "action", application="transfer", data=f"{target or '6001'} XML {context}")
+        elif dest_type == "voicemail":
+            add_voicemail_block(cond_elem, target or "1001", domain_name, tenant_id)
+        return format_xml(doc)
 
     # =========================================================================
     # SCENARIO 1 & 3: INTERNAL EXTENSION-TO-EXTENSION CALL WITH VOICEMAIL
@@ -570,9 +598,22 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     )
 
     if is_outbound:
-        # Strip dialing prefix 9 if present
-        dialed_digits = dest_number[1:] if dest_number.startswith("9") else dest_number
+        # Smart dialed digits formatting:
+        # 1. If dialed as 91 + 10 digits (12 digits, Indian E.164 without +), preserve 91...
+        # 2. If dialed with outside line prefix 9 followed by local trunk 0 (e.g. 9 + 09930573730 = 12 digits), strip leading 9 -> 09930573730
+        # 3. If dialed with outside line prefix 9 followed by 10-digit number (11 digits, e.g. 9 + 9930573730), strip leading 9 -> 9930573730
+        if dest_number.startswith("91") and len(dest_number) == 12:
+            dialed_digits = dest_number
+        elif dest_number.startswith("90") and len(dest_number) == 12:
+            dialed_digits = dest_number[1:]
+        elif dest_number.startswith("9") and len(dest_number) == 11:
+            dialed_digits = dest_number[1:]
+        elif dest_number.startswith("9") and len(dest_number) > 12:
+            dialed_digits = dest_number[1:]
+        else:
+            dialed_digits = dest_number
 
+<<<<<<< HEAD
         # 1. Check for gateway assigned to tenant via tenant_gateways or gateways.tenant_id or shared gateway
         assigned_gw = None
         if tenant_id:
@@ -624,24 +665,107 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             outbound_gateway_name = assigned_gw["name"]
         else:
             # Fallback to sip_trunks
+=======
+        # 1. Check for specific outbound call route configured in call_routes
+        outbound_gw = None
+        if tenant_id:
+            outbound_gw = await execute_query_one(
+                """
+                SELECT cr.id, g.name as gateway_name, g.proxy, g.profile
+                FROM call_routes cr
+                JOIN gateways g ON cr.gateway_id = g.id
+                WHERE cr.tenant_id = CAST(:tid AS uuid)
+                  AND cr.route_type = 'outbound'
+                  AND cr.enabled = true AND cr.deleted_at IS NULL
+                  AND g.enabled = true AND g.deleted_at IS NULL
+                ORDER BY cr.priority ASC LIMIT 1
+                """,
+                {"tid": tenant_id}
+            )
+
+        # 2. Check for assigned Sofia Gateways via tenant_gateways or direct tenant assignment
+        if not outbound_gw and tenant_id:
+            outbound_gw = await execute_query_one(
+                """
+                SELECT g.name as gateway_name, g.proxy, g.profile
+                FROM gateways g
+                LEFT JOIN tenant_gateways tg ON g.id = tg.gateway_id
+                WHERE (
+                    (tg.tenant_id = CAST(:tid AS uuid) AND tg.allow_outbound = true)
+                    OR g.tenant_id = CAST(:tid AS uuid)
+                    OR (
+                        NOT EXISTS (SELECT 1 FROM tenant_gateways WHERE gateway_id = g.id)
+                        AND g.tenant_id IS NULL
+                    )
+                )
+                AND g.enabled = true AND g.deleted_at IS NULL
+                ORDER BY 
+                    (tg.tenant_id IS NOT NULL OR g.tenant_id IS NOT NULL) DESC,
+                    COALESCE(tg.priority, 1) ASC
+                LIMIT 1
+                """,
+                {"tid": tenant_id}
+            )
+
+        # 3. Fallback to any active global gateway
+        if not outbound_gw:
+            outbound_gw = await execute_query_one(
+                """
+                SELECT g.name as gateway_name, g.proxy, g.profile
+                FROM gateways g
+                WHERE g.enabled = true AND g.deleted_at IS NULL
+                ORDER BY g.created_at ASC LIMIT 1
+                """
+            )
+
+        # 4. Fallback to sip_trunks table if no Sofia gateway configured
+        trunk = None
+        target_gw_name = outbound_gw["gateway_name"] if outbound_gw else None
+        target_host = outbound_gw.get("proxy") if outbound_gw else None
+        target_profile = outbound_gw.get("profile") if outbound_gw else None
+
+        if not target_gw_name:
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
             trunk = await execute_query_one(
                 """
                 SELECT t.name, t.host, t.port FROM sip_trunks t
                 LEFT JOIN tenant_sip_trunks tst ON t.id = tst.trunk_id
                 WHERE (
+<<<<<<< HEAD
                     tst.tenant_id = CAST(:tid AS uuid)
                     OR t.tenant_id = CAST(:tid AS uuid)
+=======
+                    (CAST(:tid AS text) IS NOT NULL AND (tst.tenant_id = CAST(:tid AS uuid) OR t.tenant_id = CAST(:tid AS uuid)))
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
                     OR (
                         NOT EXISTS (SELECT 1 FROM tenant_sip_trunks WHERE trunk_id = t.id)
                         AND t.tenant_id IS NULL
                     )
                 )
                 AND t.enabled = true AND t.deleted_at IS NULL
+<<<<<<< HEAD
                 ORDER BY (tst.tenant_id IS NOT NULL OR t.tenant_id IS NOT NULL) DESC, t.priority ASC LIMIT 1
                 """,
                 {"tid": tenant_id}
             )
             outbound_gateway_name = trunk["name"] if trunk else "tata"
+=======
+                ORDER BY t.priority ASC LIMIT 1
+                """,
+                {"tid": tenant_id}
+            )
+            if trunk:
+                target_gw_name = trunk["name"]
+                target_host = trunk["host"]
+                target_port = trunk.get("port") or 5060
+                if target_port != 5060 and ":" not in str(target_host):
+                    target_host = f"{target_host}:{target_port}"
+
+        if target_gw_name and not target_profile:
+            name_lower = target_gw_name.lower()
+            host_str = str(target_host or "")
+            target_profile = "external-crossconnect" if ("_fl" in name_lower or "fixedline" in name_lower or host_str.startswith("10.50.")) else "external"
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
 
         ext_elem = SubElement(context_elem, "extension", name=f"outbound_{dest_number}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
@@ -661,6 +785,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="effective_caller_id_name=${outbound_caller_id_name}")
         SubElement(cond_elem, "action", application="set", data="effective_caller_id_number=${outbound_caller_id_number}")
 
+<<<<<<< HEAD
         # Attempt bridge through gateway
         SubElement(cond_elem, "action", application="bridge", data=f"sofia/gateway/{outbound_gateway_name}/{dialed_digits}")
 
@@ -670,6 +795,26 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/outbound_connected.wav")
         SubElement(cond_elem, "action", application="sleep", data="500")
         SubElement(cond_elem, "action", application="echo")
+=======
+        if target_gw_name:
+            # Primary: bridge via registered Sofia gateway
+            # Failover: if gateway registration is down/invalid, failover to direct SIP URI via target profile
+            bridge_targets = [f"sofia/gateway/{target_gw_name}/{dialed_digits}"]
+            if target_host:
+                bridge_targets.append(f"sofia/{target_profile}/{dialed_digits}@{target_host}")
+            
+            bridge_data = "|".join(bridge_targets)
+            logger.info(f"Outbound route bridge data: '{bridge_data}'")
+            SubElement(cond_elem, "action", application="bridge", data=bridge_data)
+        else:
+            # Simulation fallback only when no gateways/trunks are configured in system
+            logger.info(f"No active gateway found. Using interactive test simulation for dialed digits: {dialed_digits}")
+            SubElement(cond_elem, "action", application="answer")
+            SubElement(cond_elem, "action", application="sleep", data="500")
+            SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/outbound_connected.wav")
+            SubElement(cond_elem, "action", application="sleep", data="500")
+            SubElement(cond_elem, "action", application="echo")
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
 
         return format_xml(doc)
 

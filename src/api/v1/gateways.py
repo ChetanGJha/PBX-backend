@@ -5,7 +5,11 @@ from pydantic import BaseModel, Field
 
 from src.core.database import execute_query, execute_query_one
 from src.core.permissions import get_current_user, require_roles, CurrentUser
+<<<<<<< HEAD
 from src.services.gateway_sync import sync_gateway_file, remove_gateway_file, reload_freeswitch_gateways
+=======
+from src.services.gateway_sync import sync_gateways_to_freeswitch, execute_esl_command
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
 
 router = APIRouter(prefix="/gateways", tags=["Sofia Gateways"])
 
@@ -21,6 +25,7 @@ class GatewayCreate(BaseModel):
     tenant_id: Optional[UUID] = None
     register: bool = True
     caller_id_in_from: bool = False
+    profile: Optional[str] = Field("external", description="SIP Profile: 'external' (ITS SBC) or 'external-crossconnect' (Fixed Line SBC)")
 
 
 class GatewayUpdate(BaseModel):
@@ -34,6 +39,7 @@ class GatewayUpdate(BaseModel):
     tenant_id: Optional[UUID] = None
     register: Optional[bool] = None
     caller_id_in_from: Optional[bool] = None
+    profile: Optional[str] = None
     enabled: Optional[bool] = None
 
 
@@ -56,7 +62,11 @@ async def list_gateways(current_user: CurrentUser = Depends(get_current_user)):
     if current_user.is_super_admin:
         query = """
             SELECT g.id, g.name, g.proxy, g.username, g.realm, g.from_domain, g.codecs,
+<<<<<<< HEAD
                    g.register, g.caller_id_in_from, g.enabled, g.tenant_id, g.created_at::text,
+=======
+                   g.register, g.caller_id_in_from, g.profile, g.enabled, g.tenant_id, g.created_at::text,
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
                    t.name as tenant_name, t.domain as tenant_domain
             FROM gateways g
             LEFT JOIN tenants t ON g.tenant_id = t.id
@@ -67,7 +77,11 @@ async def list_gateways(current_user: CurrentUser = Depends(get_current_user)):
     else:
         query = """
             SELECT g.id, g.name, g.proxy, g.username, g.realm, g.from_domain, g.codecs,
+<<<<<<< HEAD
                    g.register, g.caller_id_in_from, g.enabled, g.tenant_id, g.created_at::text,
+=======
+                   g.register, g.caller_id_in_from, g.profile, g.enabled, g.tenant_id, g.created_at::text,
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
                    t.name as tenant_name, t.domain as tenant_domain
             FROM gateways g
             LEFT JOIN tenants t ON g.tenant_id = t.id
@@ -85,9 +99,18 @@ async def create_gateway(
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
 ):
     """
+<<<<<<< HEAD
     Create a new Sofia Gateway and sync it to FreeSWITCH external profile.
+=======
+    Create a new Sofia Gateway, generate XML config and trigger FreeSWITCH Sofia rescan.
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
     """
+    data = payload.dict()
+    if not data.get("profile"):
+        data["profile"] = "external-crossconnect" if "10.50.185." in (data.get("proxy") or "") else "external"
+
     query = """
+<<<<<<< HEAD
         INSERT INTO gateways (name, proxy, username, password, realm, from_domain, codecs, tenant_id, register, caller_id_in_from)
         VALUES (:name, :proxy, :username, :password, :realm, :from_domain, :codecs, :tenant_id, :register, :caller_id_in_from)
         RETURNING id, name, proxy, username, realm, from_domain, codecs, tenant_id, register, caller_id_in_from, enabled, created_at::text
@@ -100,6 +123,22 @@ async def create_gateway(
     reload_freeswitch_gateways()
     
     return gw_dict
+=======
+        INSERT INTO gateways (name, proxy, username, password, realm, from_domain, codecs, tenant_id, register, caller_id_in_from, profile)
+        VALUES (:name, :proxy, :username, :password, :realm, :from_domain, :codecs, :tenant_id, :register, :caller_id_in_from, :profile)
+        RETURNING id, name, proxy, username, realm, from_domain, codecs, register, caller_id_in_from, profile, enabled, created_at::text
+    """
+    row = await execute_query_one(query, data)
+
+    # Sync to FreeSWITCH XML and rescan profile
+    try:
+        await sync_gateways_to_freeswitch()
+    except Exception as e:
+        # Don't fail the API call if FreeSWITCH is reloading
+        pass
+
+    return dict(row)
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
 
 
 @router.put("/{gateway_id}")
@@ -109,7 +148,11 @@ async def update_gateway(
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
 ):
     """
+<<<<<<< HEAD
     Update Sofia Gateway configuration, sync with FreeSWITCH external profile, and update tenant assignment.
+=======
+    Update Sofia Gateway configuration, regenerate XML and trigger FreeSWITCH rescan.
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
     """
     existing = await execute_query_one(
         "SELECT id, name FROM gateways WHERE id = CAST(:id AS uuid) AND deleted_at IS NULL",
@@ -140,6 +183,7 @@ async def update_gateway(
         UPDATE gateways
         SET {', '.join(updates)}, updated_at = NOW()
         WHERE id = CAST(:id AS uuid)
+<<<<<<< HEAD
         RETURNING id, name, proxy, username, realm, from_domain, codecs, tenant_id, register, caller_id_in_from, enabled, created_at::text
     """
     row = await execute_query_one(query, params)
@@ -156,6 +200,19 @@ async def update_gateway(
         
     reload_freeswitch_gateways()
     return gw_dict
+=======
+        RETURNING id, name, proxy, username, realm, from_domain, codecs, tenant_id, register, caller_id_in_from, profile, enabled, created_at::text
+    """
+    row = await execute_query_one(query, params)
+
+    # Sync to FreeSWITCH XML and rescan profile
+    try:
+        await sync_gateways_to_freeswitch()
+    except Exception:
+        pass
+
+    return dict(row)
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
 
 
 @router.delete("/{gateway_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -164,6 +221,7 @@ async def delete_gateway(
     current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
 ):
     """
+<<<<<<< HEAD
     Soft-delete a Sofia Gateway and remove from FreeSWITCH external profile.
     """
     existing = await execute_query_one(
@@ -174,6 +232,17 @@ async def delete_gateway(
         await execute_query("UPDATE gateways SET deleted_at = NOW(), enabled = false WHERE id = CAST(:id AS uuid)", {"id": str(gateway_id)})
         remove_gateway_file(existing["name"])
         reload_freeswitch_gateways()
+=======
+    Soft-delete a Sofia Gateway, delete XML file and remove gateway from FreeSWITCH.
+    """
+    await execute_query("UPDATE gateways SET deleted_at = NOW(), enabled = false WHERE id = CAST(:id AS uuid)", {"id": str(gateway_id)})
+    
+    try:
+        await sync_gateways_to_freeswitch()
+    except Exception:
+        pass
+        
+>>>>>>> 642b5a2a01afc3a19796c4f49f1737db7fe86dc0
     return None
 
 
@@ -200,3 +269,25 @@ async def assign_gateway_to_tenant(
     row = await execute_query_one(query, payload.dict())
     reload_freeswitch_gateways()
     return dict(row)
+
+
+@router.post("/sync")
+async def trigger_gateway_sync(
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
+):
+    """
+    Forces an immediate synchronization of all database gateways into FreeSWITCH XML and rescans profiles.
+    """
+    result = await sync_gateways_to_freeswitch()
+    return result
+
+
+@router.get("/sofia-status")
+async def get_sofia_status(
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN"]))
+):
+    """
+    Fetches live sofia status from FreeSWITCH ESL.
+    """
+    output = execute_esl_command("sofia status")
+    return {"sofia_status": output or "FreeSWITCH ESL unreachable"}

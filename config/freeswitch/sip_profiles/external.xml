@@ -10,14 +10,16 @@
     <param name="rfc2833-pt" value="101"/>
     <param name="sip-ip" value="$${local_ip_v4}"/>
     <param name="rtp-ip" value="$${local_ip_v4}"/>
-    <param name="ext-rtp-ip" value="auto-nat"/>
-    <param name="ext-sip-ip" value="auto-nat"/>
-    <param name="user-agent-string" value="MultiTenantPBX-External"/>
+    <param name="ext-rtp-ip" value="$${external_rtp_ip}"/>
+    <param name="ext-sip-ip" value="$${external_sip_ip}"/>
+    <param name="user-agent-string" value="MultiTenantPBX-External-ITS"/>
     <!-- Codec Preferences -->
     <param name="inbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
     <param name="outbound-codec-prefs" value="OPUS,PCMU,PCMA"/>
     <param name="inbound-late-negotiation" value="true"/>
     <param name="auth-calls" value="false"/>
     <param name="rtp-timeout-sec" value="300"/>
+    <param name="NDLB-force-rport" value="true"/>
+    <param name="pass-rfc2833" value="true"/>
   </settings>
 </profile>
