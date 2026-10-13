@@ -1,4 +1,4 @@
-﻿FROM debian:bookworm-slim AS tools
+FROM debian:bookworm-slim AS tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     sngrep \
@@ -12,17 +12,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TERM=xterm-256color
 ENV TERMINFO=/usr/share/terminfo
 
-# Install curl, sngrep, and required libraries from Debian Bookworm
+# Copy binaries, certificates, and terminfo without overwriting system glibc
 COPY --from=tools /usr/bin/curl /usr/bin/curl
 COPY --from=tools /usr/bin/sngrep /usr/bin/sngrep
 COPY --from=tools /etc/ssl /etc/ssl
 COPY --from=tools /etc/ca-certificates /etc/ca-certificates
 COPY --from=tools /usr/share/ca-certificates /usr/share/ca-certificates
-COPY --from=tools /lib/x86_64-linux-gnu/ /lib/x86_64-linux-gnu/
-COPY --from=tools /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 COPY --from=tools /usr/share/terminfo /usr/share/terminfo
 COPY --from=tools /etc/terminfo /etc/terminfo
-COPY --from=tools /lib/terminfo /lib/terminfo
 
 # Create recording & sound directories
 RUN mkdir -p /var/lib/freeswitch/recordings /etc/freeswitch/tls
