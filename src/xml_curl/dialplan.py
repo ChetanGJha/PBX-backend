@@ -598,8 +598,20 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     )
 
     if is_outbound:
-        # Strip dialing prefix 9 if present
-        dialed_digits = dest_number[1:] if dest_number.startswith("9") else dest_number
+        # Smart dialed digits formatting:
+        # 1. If dialed as 91 + 10 digits (12 digits, Indian E.164 without +), preserve 91...
+        # 2. If dialed with outside line prefix 9 followed by local trunk 0 (e.g. 9 + 09930573730 = 12 digits), strip leading 9 -> 09930573730
+        # 3. If dialed with outside line prefix 9 followed by 10-digit number (11 digits, e.g. 9 + 9930573730), strip leading 9 -> 9930573730
+        if dest_number.startswith("91") and len(dest_number) == 12:
+            dialed_digits = dest_number
+        elif dest_number.startswith("90") and len(dest_number) == 12:
+            dialed_digits = dest_number[1:]
+        elif dest_number.startswith("9") and len(dest_number) == 11:
+            dialed_digits = dest_number[1:]
+        elif dest_number.startswith("9") and len(dest_number) > 12:
+            dialed_digits = dest_number[1:]
+        else:
+            dialed_digits = dest_number
 
         # 1. Check for specific outbound call route configured in call_routes
         outbound_gw = None
@@ -654,11 +666,15 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             )
 
         # 4. Fallback to sip_trunks table if no Sofia gateway configured
-        trunk_name = outbound_gw["gateway_name"] if outbound_gw else None
-        if not trunk_name:
+        trunk = None
+        target_gw_name = outbound_gw["gateway_name"] if outbound_gw else None
+        target_host = outbound_gw.get("proxy") if outbound_gw else None
+        target_profile = outbound_gw.get("profile") if outbound_gw else None
+
+        if not target_gw_name:
             trunk = await execute_query_one(
                 """
-                SELECT t.name FROM sip_trunks t
+                SELECT t.name, t.host, t.port FROM sip_trunks t
                 LEFT JOIN tenant_sip_trunks tst ON t.id = tst.trunk_id
                 WHERE (
                     (CAST(:tid AS text) IS NOT NULL AND (tst.tenant_id = CAST(:tid AS uuid) OR t.tenant_id = CAST(:tid AS uuid)))
@@ -673,7 +689,16 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
                 {"tid": tenant_id}
             )
             if trunk:
-                trunk_name = trunk["name"]
+                target_gw_name = trunk["name"]
+                target_host = trunk["host"]
+                target_port = trunk.get("port") or 5060
+                if target_port != 5060 and ":" not in str(target_host):
+                    target_host = f"{target_host}:{target_port}"
+
+        if target_gw_name and not target_profile:
+            name_lower = target_gw_name.lower()
+            host_str = str(target_host or "")
+            target_profile = "external-crossconnect" if ("_fl" in name_lower or "fixedline" in name_lower or host_str.startswith("10.50.")) else "external"
 
         ext_elem = SubElement(context_elem, "extension", name=f"outbound_{dest_number}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
@@ -693,10 +718,16 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="effective_caller_id_name=${outbound_caller_id_name}")
         SubElement(cond_elem, "action", application="set", data="effective_caller_id_number=${outbound_caller_id_number}")
 
-        if trunk_name:
-            # Route through configured real gateway
-            logger.info(f"Outbound route selected gateway: '{trunk_name}' for destination: '{dialed_digits}'")
-            SubElement(cond_elem, "action", application="bridge", data=f"sofia/gateway/{trunk_name}/{dialed_digits}")
+        if target_gw_name:
+            # Primary: bridge via registered Sofia gateway
+            # Failover: if gateway registration is down/invalid, failover to direct SIP URI via target profile
+            bridge_targets = [f"sofia/gateway/{target_gw_name}/{dialed_digits}"]
+            if target_host:
+                bridge_targets.append(f"sofia/{target_profile}/{dialed_digits}@{target_host}")
+            
+            bridge_data = "|".join(bridge_targets)
+            logger.info(f"Outbound route bridge data: '{bridge_data}'")
+            SubElement(cond_elem, "action", application="bridge", data=bridge_data)
         else:
             # Simulation fallback only when no gateways/trunks are configured in system
             logger.info(f"No active gateway found. Using interactive test simulation for dialed digits: {dialed_digits}")
