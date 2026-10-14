@@ -398,18 +398,32 @@ async def process_cdr_record(cdr_data: dict) -> dict:
         except Exception as vm_exc:
             logger.warning(f"Error saving voicemail from CDR: {vm_exc}")
 
-    return {
+    processed = {
         "call_uuid": call_uuid,
         "tenant_id": tenant_id,
         "direction": direction,
         "caller_number": caller_number,
         "caller_name": caller_name,
         "destination": destination,
+        "source_extension": caller_number,
+        "destination_extension": destination,
+        "start_time": start_time.isoformat() if start_time else None,
+        "answer_time": answer_time.isoformat() if answer_time else None,
+        "end_time": end_time.isoformat() if end_time else None,
         "duration": duration,
         "billsec": billsec,
         "hangup_cause": hangup_cause,
+        "hangup_code": hangup_code,
         "recording_id": recording_id
     }
+
+    try:
+        from src.core.websocket_manager import ws_manager
+        asyncio.create_task(ws_manager.broadcast_cdr_created(processed))
+    except Exception as ws_err:
+        logger.warning(f"Failed to broadcast CDR over websocket: {ws_err}")
+
+    return processed
 
 
 @router.post("/cdr")
