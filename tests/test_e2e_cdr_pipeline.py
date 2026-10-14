@@ -1,9 +1,11 @@
+import os
 import unittest
 import urllib.parse
 from uuid import uuid4
 import requests
 
-API_URL = "http://localhost:8000"
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+WS_HOST = os.getenv("WS_HOST", "127.0.0.1:8000")
 
 SAMPLE_XML_TEMPLATE = """<?xml version="1.0"?>
 <cdr core-uuid="freeswitch-core-1">
@@ -173,7 +175,7 @@ class TestE2ECdrPipeline(unittest.TestCase):
         import time
 
         async def _run_ws_test():
-            ws_url = f"ws://localhost:8000/ws/reports?token={self.token}"
+            ws_url = f"ws://{WS_HOST}/ws/reports?token={self.token}"
             async with websockets.connect(ws_url) as ws:
                 # Post a CDR
                 call_uuid = str(uuid4())
