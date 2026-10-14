@@ -327,7 +327,14 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         hg_timeout = hunt_group.get("timeout") or 25
         raw_members = hunt_group.get("members") or ""
         hg_tenant_id = hunt_group.get("tenant_id") or tenant_id
-        logger.info(f"Routing to Hunt Group '{hg_name}' (ext {dest_number}) with members: {raw_members}")
+        if hg_tenant_id:
+            t_row = await execute_query_one(
+                "SELECT sip_domain FROM tenants WHERE id = CAST(:tid AS uuid) AND deleted_at IS NULL",
+                {"tid": str(hg_tenant_id)}
+            )
+            if t_row and t_row.get("sip_domain"):
+                domain_name = t_row["sip_domain"]
+        logger.info(f"Routing to Hunt Group '{hg_name}' (ext {dest_number}) with members: {raw_members} domain: {domain_name}")
 
         # Parse member extensions: strip whitespace and any domain part (e.g. 1001@pbx.aikyamlabs.local -> 1001)
         member_list = []
@@ -424,9 +431,31 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/{target}@{domain_name}")
             add_voicemail_block(cond_elem, target, domain_name, tenant_id)
         elif dest_type == "queue":
-            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/1001@{domain_name},user/1002@{domain_name}")
+            SubElement(cond_elem, "action", application="answer")
+            SubElement(cond_elem, "action", application="callcenter", data=target)
         elif dest_type == "hunt_group":
-            SubElement(cond_elem, "action", application="transfer", data=f"{target or '8888'} XML {context}")
+            hg_row = await execute_query_one(
+                """
+                SELECT id, name, extension_number, strategy, members, timeout, tenant_id
+                FROM hunt_groups
+                WHERE (extension_number = :t OR id::text = :t) AND enabled = true AND deleted_at IS NULL
+                LIMIT 1
+                """,
+                {"t": target}
+            )
+            if hg_row:
+                raw_m = hg_row.get("members") or ""
+                hg_to = hg_row.get("timeout") or 25
+                m_list = [m.split("@")[0].strip() for m in raw_m.split(",") if m.strip()]
+                b_endpoints = [f"user/{m_ext}@{domain_name}" for m_ext in m_list if m_ext]
+                if b_endpoints:
+                    SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={hg_to}]" + ",".join(b_endpoints))
+                fallback_ext = m_list[0] if m_list else "1001"
+                add_voicemail_block(cond_elem, fallback_ext, domain_name, tenant_id)
+            else:
+                SubElement(cond_elem, "action", application="transfer", data=f"{target or '8888'} XML {context}")
+        elif dest_type == "conference":
+            SubElement(cond_elem, "action", application="transfer", data=f"{target} XML {context}")
         elif dest_type == "ivr":
             SubElement(cond_elem, "action", application="transfer", data=f"{target or '6001'} XML {context}")
         elif dest_type == "voicemail":
