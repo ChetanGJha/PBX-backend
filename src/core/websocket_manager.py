@@ -51,4 +51,13 @@ class ConnectionManager:
         target_tenant = cdr_data.get("tenant_id")
         await self.broadcast(event, tenant_id=target_tenant)
 
+    async def broadcast_voicemail_created(self, vm_data: dict):
+        event = {
+            "event": "voicemail.created",
+            "type": "voicemail.created",
+            "data": vm_data
+        }
+        target_tenant = vm_data.get("tenant_id")
+        await self.broadcast(event, tenant_id=target_tenant)
+
 ws_manager = ConnectionManager()

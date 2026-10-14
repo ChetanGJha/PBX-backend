@@ -11,6 +11,7 @@ from src.xml_curl.directory import handle_directory_request
 from src.xml_curl.dialplan import handle_dialplan_request
 from src.core.database import execute_query_one, execute_query
 from src.core.email_service import send_voicemail_notification
+from src.core.websocket_manager import ws_manager
 
 logger = logging.getLogger("pbx.xml_curl.router")
 
@@ -538,6 +539,18 @@ async def handle_voicemail_webhook(request: Request):
                 duration=duration,
                 tenant_id=tenant_id
             )
+        )
+
+        # Broadcast real-time websocket event
+        asyncio.create_task(
+            ws_manager.broadcast_voicemail_created({
+                "message_id": msg_id,
+                "extension_number": extension_number,
+                "caller_id_name": caller_id_name,
+                "caller_id_number": caller_id_number,
+                "duration": duration,
+                "tenant_id": tenant_id
+            })
         )
 
         logger.info(
