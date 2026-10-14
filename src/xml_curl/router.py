@@ -30,7 +30,7 @@ XML_CDR_CONF_XML = """<?xml version="1.0" encoding="UTF-8" standalone="no"?>
       <settings>
         <param name="url" value="http://api:8000/freeswitch/cdr"/>
         <param name="retries" value="3"/>
-        <param name="delay" value="0"/>
+        <param name="delay" value="5"/>
         <param name="log-b-leg" value="false"/>
         <param name="prefix-a-leg" value="false"/>
         <param name="encode" value="true"/>
