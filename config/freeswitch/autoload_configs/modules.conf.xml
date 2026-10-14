@@ -26,6 +26,7 @@
     <load module="mod_loopback"/>
     <load module="mod_commands"/>
     <load module="mod_conference"/>
+    <load module="mod_callcenter"/>
     <load module="mod_voicemail"/>
     <load module="mod_valet_parking"/>
     <load module="mod_hash"/>

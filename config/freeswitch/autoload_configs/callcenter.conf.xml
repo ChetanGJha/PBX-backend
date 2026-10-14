@@ -1,0 +1,43 @@
+<configuration name="callcenter.conf" description="CallCenter">
+  <settings>
+    <!-- Settings can be overridden dynamically -->
+  </settings>
+
+  <queues>
+    <queue name="default">
+      <param name="strategy" value="round-robin"/>
+      <param name="moh-sound" value="local_stream://moh"/>
+      <param name="record-template" value="/var/lib/freeswitch/recordings/${tenant_id}/${uuid}.wav"/>
+      <param name="time-base-score" value="system"/>
+      <param name="max-wait-time" value="0"/>
+      <param name="max-wait-time-with-no-agent" value="0"/>
+      <param name="tier-rules-apply" value="false"/>
+      <param name="tier-rule-wait-second" value="300"/>
+      <param name="tier-rule-wait-multiply-level" value="true"/>
+      <param name="tier-rule-no-agent-no-wait" value="false"/>
+      <param name="discard-abandoned-after" value="60"/>
+      <param name="abandoned-resume-allowed" value="false"/>
+    </queue>
+
+    <queue name="support@default">
+      <param name="strategy" value="longest-idle-agent"/>
+      <param name="moh-sound" value="local_stream://moh"/>
+      <param name="record-template" value="/var/lib/freeswitch/recordings/${tenant_id}/${uuid}.wav"/>
+      <param name="time-base-score" value="system"/>
+      <param name="max-wait-time" value="0"/>
+      <param name="max-wait-time-with-no-agent" value="0"/>
+      <param name="tier-rules-apply" value="false"/>
+      <param name="tier-rule-wait-second" value="300"/>
+      <param name="tier-rule-wait-multiply-level" value="true"/>
+      <param name="tier-rule-no-agent-no-wait" value="false"/>
+      <param name="discard-abandoned-after" value="60"/>
+      <param name="abandoned-resume-allowed" value="false"/>
+    </queue>
+  </queues>
+
+  <agents>
+  </agents>
+
+  <tiers>
+  </tiers>
+</configuration>
