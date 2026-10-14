@@ -1,3 +1,4 @@
+import os
 import logging
 import socket
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -833,12 +834,12 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     return NOT_FOUND_XML
 
 
-def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str):
+def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str, custom_greeting_path: Optional[str] = None):
     """
     Appends full Voicemail execution actions:
     1. Answers the channel
     2. Sets channel variables for CDR fallback logging
-    3. Plays 'User not available, please leave a voicemail' greeting
+    3. Plays custom or synthesized 'User not available, please leave a voicemail' greeting
     4. Plays 1000Hz beep tone
     5. Records caller's audio message to disk
     6. Calls API webhook to record to database and queue email dispatch
@@ -859,8 +860,12 @@ def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id
     SubElement(cond_elem, "action", application="set", data=f"api_hangup_hook=curl {curl_url} post")
     SubElement(cond_elem, "action", application="set", data="session_in_hangup_hook=true")
 
-    # Play customized Voicemail Prompt ("User at extension {ext_num} is not available, please leave a voice message after the beep")
-    prompt_path = ensure_voicemail_prompt(ext_num)
+    # Resolve greeting audio prompt: custom uploaded audio file or synthesized dynamic prompt
+    if custom_greeting_path and os.path.exists(custom_greeting_path):
+        prompt_path = custom_greeting_path
+    else:
+        prompt_path = ensure_voicemail_prompt(ext_num)
+
     SubElement(cond_elem, "action", application="playback", data=prompt_path)
     # Play Beep Tone (native FreeSWITCH 1000Hz tone for 500ms)
     SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,0,1000)")
