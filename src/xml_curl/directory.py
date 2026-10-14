@@ -100,10 +100,9 @@ async def handle_directory_request(form_data: Dict[str, Any]) -> str:
     doc = Element("document", type="freeswitch/xml")
     section = SubElement(doc, "section", name="directory")
 
-    # Support both the queried domain (which may be an IP or FQDN) and the tenant's canonical sip_domain
-    domains_to_create = [domain_name]
-    if sip_domain and sip_domain != domain_name:
-        domains_to_create.append(sip_domain)
+    # Support queried domain, tenant sip_domain, and production VM domain aliases
+    aliases = [domain_name, sip_domain, "pbx.terrixai.com", "terrixai.com", "8.234.117.15", "pbx.aikyamlabs.local", "127.0.0.1"]
+    domains_to_create = list(dict.fromkeys([a for a in aliases if a]))
 
     # Standard Sofia dial-string allows FreeSWITCH to locate the live Sofia registration contact
     sofia_dial_string = "{presence_id=${dialed_user}@${dialed_domain}}${sofia_contact(${dialed_user}@${dialed_domain})}"

@@ -42,7 +42,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     dest_number = form_data.get("Caller-Destination-Number", "").strip()
     caller_id_number = form_data.get("Caller-Caller-ID-Number", "").strip()
     caller_id_name = form_data.get("Caller-Caller-ID-Name", "").strip()
-    domain_name = form_data.get("domain") or form_data.get("variable_domain_name") or form_data.get("variable_sip_req_host") or "pbx.aikyamlabs.local"
+    domain_name = form_data.get("domain") or form_data.get("variable_domain_name") or form_data.get("variable_sip_req_host") or "pbx.terrixai.com"
     tenant_id = form_data.get("variable_tenant_id") or form_data.get("variable_accountcode")
 
     logger.info(
@@ -52,6 +52,15 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
 
     if not dest_number:
         return NOT_FOUND_XML
+
+    # Resolve Tenant ID from caller extension if present
+    if not tenant_id and caller_id_number:
+        caller_ext = await execute_query_one(
+            "SELECT tenant_id FROM extensions WHERE extension_number = :ext AND enabled = true AND deleted_at IS NULL LIMIT 1",
+            {"ext": caller_id_number}
+        )
+        if caller_ext and caller_ext.get("tenant_id"):
+            tenant_id = str(caller_ext["tenant_id"])
 
     # Resolve Tenant ID if not already passed in channel variables
     if not tenant_id and context.startswith("tenant-"):
@@ -150,25 +159,28 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     # =========================================================================
     # SCENARIO 4: INCOMING CALLS WITH TEST DIDs / QUEUE / IVR / HUNT GROUP
     # =========================================================================
-    # Test DID 1: Route to Call Queue (TESTQ / 7777 / 5551 / +15551001)
-    if dest_number in ("5551", "+15551001", "7777"):
-        ext_elem = SubElement(context_elem, "extension", name="route_queue")
+    # Dynamic Queue Lookup from Database or default test DIDs
+    q_direct = await execute_query_one(
+        """
+        SELECT queue_number, name, tenant_id FROM queues
+        WHERE (queue_number = :dest OR name = :dest OR id::text = :dest)
+          AND enabled = true AND deleted_at IS NULL
+        LIMIT 1
+        """,
+        {"dest": dest_number}
+    )
+    if q_direct or dest_number in ("5551", "+15551001", "7777"):
+        q_num = q_direct["queue_number"] if q_direct else "default"
+        q_tid = str(q_direct.get("tenant_id") if q_direct else tenant_id or "")
+        ext_elem = SubElement(context_elem, "extension", name=f"route_queue_{q_num}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-        SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={q_tid}")
         SubElement(cond_elem, "action", application="set", data="direction=inbound")
-        SubElement(cond_elem, "action", application="set", data="did=5551")
+        SubElement(cond_elem, "action", application="set", data=f"did={dest_number}")
         SubElement(cond_elem, "action", application="set", data="hangup_after_bridge=true")
         SubElement(cond_elem, "action", application="export", data="hangup_after_bridge=true")
-        SubElement(cond_elem, "action", application="set", data=f"continue_on_fail={VOICEMAIL_CONTINUE_ON_FAIL}")
-        SubElement(cond_elem, "action", application="set", data=f"recording_file=/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
-        SubElement(cond_elem, "action", application="record_session", data=f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
         SubElement(cond_elem, "action", application="answer")
-        SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
-        SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
-        # Ring available queue agents simultaneously with 20s timeout
-        SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/1001@{domain_name},user/1002@{domain_name}")
-        # Voicemail fallback if no agent answers
-        add_voicemail_block(cond_elem, "1001", domain_name, tenant_id)
+        SubElement(cond_elem, "action", application="callcenter", data=q_num)
         return format_xml(doc)
 
     # Check for IVR Menu configured in database or default test DIDs
@@ -179,10 +191,22 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SELECT id, name, extension_number, timeout, max_retries, greeting_audio
             FROM ivr_menus
             WHERE tenant_id = CAST(:tid AS uuid)
-              AND extension_number = :dest AND enabled = true AND deleted_at IS NULL
+              AND (extension_number = :dest OR name = :dest OR id::text = :dest)
+              AND enabled = true AND deleted_at IS NULL
             ORDER BY updated_at DESC LIMIT 1
             """,
             {"tid": tenant_id, "dest": dest_number}
+        )
+    if not ivr_menu:
+        ivr_menu = await execute_query_one(
+            """
+            SELECT id, name, extension_number, timeout, max_retries, greeting_audio
+            FROM ivr_menus
+            WHERE (extension_number = :dest OR name = :dest OR id::text = :dest)
+              AND enabled = true AND deleted_at IS NULL
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            {"dest": dest_number}
         )
 
     # Test DID 2 & IVR (6001 / 5552 / +15551002 or matched ivr_menus)
@@ -393,7 +417,8 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     hg_query = """
         SELECT id, name, extension_number, strategy, members, timeout, tenant_id
         FROM hunt_groups
-        WHERE extension_number = :dest AND enabled = true AND deleted_at IS NULL
+        WHERE (extension_number = :dest OR name = :dest OR id::text = :dest)
+          AND enabled = true AND deleted_at IS NULL
         LIMIT 1
     """
     hunt_group = await execute_query_one(hg_query, {"dest": dest_number})
@@ -413,6 +438,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         hg_name = hunt_group["name"]
         hg_timeout = hunt_group.get("timeout") or 25
         raw_members = hunt_group.get("members") or ""
+        hg_strategy = (hunt_group.get("strategy") or "simultaneous").lower()
         hg_tenant_id = hunt_group.get("tenant_id") or tenant_id
         if hg_tenant_id:
             t_row = await execute_query_one(
@@ -452,8 +478,9 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         bridge_endpoints = [f"user/{m_ext}@{domain_name}" for m_ext in member_list]
 
         if bridge_endpoints:
-            # Simultaneous bridge strategy rings all member endpoints together
-            bridge_data = f"[leg_timeout={hg_timeout}]" + ",".join(bridge_endpoints)
+            # Sequential uses '|', Simultaneous uses ','
+            sep = "|" if hg_strategy == "sequential" else ","
+            bridge_data = f"[leg_timeout={hg_timeout}]" + sep.join(bridge_endpoints)
             SubElement(cond_elem, "action", application="bridge", data=bridge_data)
 
         # Fallback to voicemail on the first member extension if nobody answers
@@ -472,6 +499,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             OR cr.did_number = '+' || :dest 
             OR cr.did_number = TRIM(LEADING '+' FROM :dest)
             OR :dest LIKE '%' || cr.did_number
+            OR (LENGTH(:dest) >= 10 AND LENGTH(cr.did_number) >= 10 AND RIGHT(:dest, 10) = RIGHT(cr.did_number, 10))
         )
         AND cr.route_type = 'inbound_did' AND cr.enabled = true AND cr.deleted_at IS NULL
         ORDER BY cr.priority ASC LIMIT 1
@@ -489,6 +517,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
                 OR d.did_number = '+' || :dest 
                 OR d.did_number = TRIM(LEADING '+' FROM :dest)
                 OR :dest LIKE '%' || d.did_number
+                OR (LENGTH(:dest) >= 10 AND LENGTH(d.did_number) >= 10 AND RIGHT(:dest, 10) = RIGHT(d.did_number, 10))
             )
             AND d.enabled = true AND d.deleted_at IS NULL
             LIMIT 1
@@ -498,9 +527,9 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
 
     if inbound_route:
         tenant_id = str(inbound_route.get("tenant_id") or tenant_id or "")
-        domain_name = inbound_route.get("sip_domain") or domain_name
+        domain_name = inbound_route.get("sip_domain") or domain_name or "pbx.terrixai.com"
         dest_type = inbound_route.get("destination_type") or "extension"
-        target = inbound_route.get("destination") or "1001"
+        target = (inbound_route.get("destination") or "1001").strip()
         ext_elem = SubElement(context_elem, "extension", name=f"did_{dest_number}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
         SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
@@ -514,29 +543,54 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
         SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
 
+        candidate_domains = list(dict.fromkeys([domain_name, "pbx.terrixai.com", "8.234.117.15", "pbx.aikyamlabs.local"]))
+
         if dest_type == "extension":
-            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/{target}@{domain_name}")
+            bridge_endpoints = [f"user/{target}@{d}" for d in candidate_domains if d] + [f"user/{target}"]
+            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]" + ",".join(bridge_endpoints))
             add_voicemail_block(cond_elem, target, domain_name, tenant_id)
         elif dest_type == "queue":
+            q_row = await execute_query_one(
+                """
+                SELECT queue_number, name FROM queues
+                WHERE (queue_number = :t OR name = :t OR id::text = :t)
+                  AND enabled = true AND deleted_at IS NULL
+                LIMIT 1
+                """,
+                {"t": target}
+            )
+            q_target = q_row["queue_number"] if q_row else (target or "default")
             SubElement(cond_elem, "action", application="answer")
-            SubElement(cond_elem, "action", application="callcenter", data=target)
+            SubElement(cond_elem, "action", application="callcenter", data=q_target)
         elif dest_type == "hunt_group":
             hg_row = await execute_query_one(
                 """
                 SELECT id, name, extension_number, strategy, members, timeout, tenant_id
                 FROM hunt_groups
-                WHERE (extension_number = :t OR id::text = :t) AND enabled = true AND deleted_at IS NULL
+                WHERE (extension_number = :t OR name = :t OR id::text = :t) AND enabled = true AND deleted_at IS NULL
                 LIMIT 1
                 """,
                 {"t": target}
             )
+            if not hg_row and tenant_id:
+                hg_row = await execute_query_one(
+                    """
+                    SELECT id, name, extension_number, strategy, members, timeout, tenant_id
+                    FROM hunt_groups
+                    WHERE tenant_id = CAST(:tid AS uuid) AND enabled = true AND deleted_at IS NULL
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    {"tid": tenant_id}
+                )
             if hg_row:
                 raw_m = hg_row.get("members") or ""
                 hg_to = hg_row.get("timeout") or 25
+                hg_strat = (hg_row.get("strategy") or "simultaneous").lower()
                 m_list = [m.split("@")[0].strip() for m in raw_m.split(",") if m.strip()]
                 b_endpoints = [f"user/{m_ext}@{domain_name}" for m_ext in m_list if m_ext]
                 if b_endpoints:
-                    SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={hg_to}]" + ",".join(b_endpoints))
+                    sep = "|" if hg_strat == "sequential" else ","
+                    SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={hg_to}]" + sep.join(b_endpoints))
                 fallback_ext = m_list[0] if m_list else "1001"
                 add_voicemail_block(cond_elem, fallback_ext, domain_name, tenant_id)
             else:
@@ -544,7 +598,49 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         elif dest_type == "conference":
             SubElement(cond_elem, "action", application="transfer", data=f"{target} XML {context}")
         elif dest_type == "ivr":
-            SubElement(cond_elem, "action", application="transfer", data=f"{target or '6001'} XML {context}")
+            ivr_row = await execute_query_one(
+                """
+                SELECT id, name, extension_number, timeout, max_retries, greeting_audio
+                FROM ivr_menus
+                WHERE (name = :t OR extension_number = :t OR id::text = :t)
+                  AND enabled = true AND deleted_at IS NULL
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                {"t": target}
+            )
+            if not ivr_row and tenant_id:
+                ivr_row = await execute_query_one(
+                    """
+                    SELECT id, name, extension_number, timeout, max_retries, greeting_audio
+                    FROM ivr_menus
+                    WHERE tenant_id = CAST(:tid AS uuid) AND enabled = true AND deleted_at IS NULL
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    {"tid": tenant_id}
+                )
+            menu_id = str(ivr_row["id"]) if ivr_row else "46765586-c906-497f-83ba-0d39776cfbe4"
+            SubElement(cond_elem, "action", application="set", data=f"ivr_menu_id={menu_id}")
+            SubElement(cond_elem, "action", application="answer")
+            SubElement(cond_elem, "action", application="sleep", data="500")
+
+            menu_timeout = 5000
+            if ivr_row and ivr_row.get("timeout"):
+                menu_timeout = int(ivr_row["timeout"]) * 1000
+
+            prompt_file = "/var/lib/freeswitch/recordings/prompts/ivr_welcome.wav"
+            if ivr_row and ivr_row.get("greeting_audio"):
+                db_audio = ivr_row["greeting_audio"]
+                if os.path.exists(f"/var/lib/freeswitch/recordings/prompts/{db_audio}"):
+                    prompt_file = f"/var/lib/freeswitch/recordings/prompts/{db_audio}"
+
+            SubElement(
+                cond_elem,
+                "action",
+                application="play_and_get_digits",
+                data=f"1 4 3 {menu_timeout} # {prompt_file} /var/lib/freeswitch/recordings/prompts/beep.wav dtmf_result \\d+"
+            )
+            SubElement(cond_elem, "action", application="transfer", data="ivr_choice_${dtmf_result} XML " + context)
+            SubElement(cond_elem, "action", application="transfer", data="1001 XML " + context)
         elif dest_type == "voicemail":
             add_voicemail_block(cond_elem, target or "1001", domain_name, tenant_id)
         return format_xml(doc)
@@ -557,14 +653,31 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         target_ext = await execute_query_one(
             """
             SELECT e.id, e.extension_number, e.display_name, e.caller_id_name, e.caller_id_number,
-                   e.email, e.enabled, e.no_answer_timeout, t.sip_domain
+                   e.email, e.enabled, e.no_answer_timeout, e.tenant_id, t.sip_domain
             FROM extensions e
             JOIN tenants t ON e.tenant_id = t.id
-            WHERE e.tenant_id = :tenant_id AND e.extension_number = :dest
+            WHERE e.tenant_id = CAST(:tenant_id AS uuid) AND e.extension_number = :dest
               AND e.enabled = true AND e.deleted_at IS NULL
             """,
             {"tenant_id": tenant_id, "dest": dest_number}
         )
+
+    if not target_ext:
+        target_ext = await execute_query_one(
+            """
+            SELECT e.id, e.extension_number, e.display_name, e.caller_id_name, e.caller_id_number,
+                   e.email, e.enabled, e.no_answer_timeout, e.tenant_id, t.sip_domain
+            FROM extensions e
+            JOIN tenants t ON e.tenant_id = t.id
+            WHERE e.extension_number = :dest
+              AND e.enabled = true AND e.deleted_at IS NULL
+            LIMIT 1
+            """,
+            {"dest": dest_number}
+        )
+
+    if target_ext and not tenant_id:
+        tenant_id = str(target_ext.get("tenant_id") or "")
 
     if target_ext:
         ext_num = target_ext["extension_number"]
@@ -623,6 +736,8 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         # Set standard call & CDR variables
         SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
         SubElement(cond_elem, "action", application="set", data="direction=internal")
+        SubElement(cond_elem, "action", application="set", data="hangup_after_bridge=true")
+        SubElement(cond_elem, "action", application="export", data="hangup_after_bridge=true")
 
         # Ringing timeout variables with ignore_early_media=true so timer counts while ringing
         SubElement(cond_elem, "action", application="set", data="ignore_early_media=true")
@@ -656,9 +771,16 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             logger.info(f"Extension {ext_num} has unconditional forward to {cf_dest}")
             SubElement(cond_elem, "action", application="transfer", data=f"{cf_dest} XML {context}")
         else:
-            logger.info(f"Bridging internal call to user/{ext_num}@{callee_domain} with timeout={timeout}s...")
+            candidate_domains = [callee_domain]
+            for d in [domain_name, "pbx.terrixai.com", "8.234.117.15", "pbx.aikyamlabs.local"]:
+                if d and d not in candidate_domains:
+                    candidate_domains.append(d)
+            bridge_targets = [f"user/{ext_num}@{d}" for d in candidate_domains]
+            bridge_targets.append(f"user/{ext_num}")
+            bridge_str = ",".join(bridge_targets)
+            logger.info(f"Bridging internal call to endpoints '{bridge_str}' with timeout={timeout}s...")
             bridge_opts = f"{{ignore_early_media=true,originate_timeout={timeout},call_timeout={timeout},leg_timeout={timeout},continue_on_fail=true}}"
-            SubElement(cond_elem, "action", application="bridge", data=f"{bridge_opts}user/{ext_num}@{callee_domain}")
+            SubElement(cond_elem, "action", application="bridge", data=f"{bridge_opts}{bridge_str}")
             SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
 
         # Declare the forward-on-no-answer extension in context if enabled
@@ -704,7 +826,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         else:
             dialed_digits = dest_number
 
-        # 1. Check for specific outbound call route configured in call_routes
+        # 1. Check for specific outbound call route configured in call_routes for this tenant
         outbound_gw = None
         if tenant_id:
             outbound_gw = await execute_query_one(
@@ -731,50 +853,27 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
                 WHERE (
                     (tg.tenant_id = CAST(:tid AS uuid) AND tg.allow_outbound = true)
                     OR g.tenant_id = CAST(:tid AS uuid)
-                    OR (
-                        NOT EXISTS (SELECT 1 FROM tenant_gateways WHERE gateway_id = g.id)
-                        AND g.tenant_id IS NULL
-                    )
                 )
                 AND g.enabled = true AND g.deleted_at IS NULL
-                ORDER BY 
-                    (tg.tenant_id IS NOT NULL OR g.tenant_id IS NOT NULL) DESC,
-                    COALESCE(tg.priority, 1) ASC
+                ORDER BY COALESCE(tg.priority, 1) ASC
                 LIMIT 1
                 """,
                 {"tid": tenant_id}
             )
 
-        # 3. Fallback to any active global gateway
-        if not outbound_gw:
-            outbound_gw = await execute_query_one(
-                """
-                SELECT g.name as gateway_name, g.proxy, g.profile
-                FROM gateways g
-                WHERE g.enabled = true AND g.deleted_at IS NULL
-                ORDER BY g.created_at ASC LIMIT 1
-                """
-            )
-
-        # 4. Fallback to sip_trunks table if no Sofia gateway configured
+        # 3. Check for assigned SIP trunks for this tenant
         trunk = None
         target_gw_name = outbound_gw["gateway_name"] if outbound_gw else None
         target_host = outbound_gw.get("proxy") if outbound_gw else None
         target_profile = outbound_gw.get("profile") if outbound_gw else None
 
-        if not target_gw_name:
+        if not target_gw_name and tenant_id:
             trunk = await execute_query_one(
                 """
                 SELECT t.name, t.host, t.port FROM sip_trunks t
                 LEFT JOIN tenant_sip_trunks tst ON t.id = tst.trunk_id
-                WHERE (
-                    (CAST(:tid AS text) IS NOT NULL AND (tst.tenant_id = CAST(:tid AS uuid) OR t.tenant_id = CAST(:tid AS uuid)))
-                    OR (
-                        NOT EXISTS (SELECT 1 FROM tenant_sip_trunks WHERE trunk_id = t.id)
-                        AND t.tenant_id IS NULL
-                    )
-                )
-                AND t.enabled = true AND t.deleted_at IS NULL
+                WHERE (tst.tenant_id = CAST(:tid AS uuid) OR t.tenant_id = CAST(:tid AS uuid))
+                  AND t.enabled = true AND t.deleted_at IS NULL
                 ORDER BY t.priority ASC LIMIT 1
                 """,
                 {"tid": tenant_id}
@@ -786,7 +885,20 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
                 if target_port != 5060 and ":" not in str(target_host):
                     target_host = f"{target_host}:{target_port}"
 
-        if target_gw_name and not target_profile:
+        # If tenant has no gateway assigned: OUTBOUND CALLS MUST FAIL!
+        if not target_gw_name:
+            logger.warning(
+                f"Outbound call rejected: Tenant '{tenant_id}' has no assigned gateway or outbound trunk. "
+                f"Destination: {dialed_digits}"
+            )
+            ext_elem = SubElement(context_elem, "extension", name=f"reject_unassigned_gateway_{dest_number}")
+            cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+            SubElement(cond_elem, "action", application="set", data=f"tenant_id={tenant_id}")
+            SubElement(cond_elem, "action", application="respond", data="403 Forbidden - No Gateway Assigned")
+            SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
+            return format_xml(doc)
+
+        if not target_profile:
             name_lower = target_gw_name.lower()
             host_str = str(target_host or "")
             target_profile = "external-crossconnect" if ("_fl" in name_lower or "fixedline" in name_lower or host_str.startswith("10.50.")) else "external"
@@ -809,25 +921,15 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="effective_caller_id_name=${outbound_caller_id_name}")
         SubElement(cond_elem, "action", application="set", data="effective_caller_id_number=${outbound_caller_id_number}")
 
-        if target_gw_name:
-            # Primary: bridge via registered Sofia gateway
-            # Failover: if gateway registration is down/invalid, failover to direct SIP URI via target profile
-            bridge_targets = [f"sofia/gateway/{target_gw_name}/{dialed_digits}"]
-            if target_host:
-                bridge_targets.append(f"sofia/{target_profile}/{dialed_digits}@{target_host}")
-            
-            bridge_data = "|".join(bridge_targets)
-            logger.info(f"Outbound route bridge data: '{bridge_data}'")
-            SubElement(cond_elem, "action", application="bridge", data=bridge_data)
-        else:
-            # Simulation fallback only when no gateways/trunks are configured in system
-            logger.info(f"No active gateway found. Using interactive test simulation for dialed digits: {dialed_digits}")
-            SubElement(cond_elem, "action", application="answer")
-            SubElement(cond_elem, "action", application="sleep", data="500")
-            SubElement(cond_elem, "action", application="playback", data="/var/lib/freeswitch/recordings/prompts/outbound_connected.wav")
-            SubElement(cond_elem, "action", application="sleep", data="500")
-            SubElement(cond_elem, "action", application="echo")
-
+        # Primary: bridge via registered Sofia gateway
+        # Failover: if gateway registration is down/invalid, failover to direct SIP URI via target profile
+        bridge_targets = [f"sofia/gateway/{target_gw_name}/{dialed_digits}"]
+        if target_host:
+            bridge_targets.append(f"sofia/{target_profile}/{dialed_digits}@{target_host}")
+        
+        bridge_data = "|".join(bridge_targets)
+        logger.info(f"Outbound route bridge data: '{bridge_data}'")
+        SubElement(cond_elem, "action", application="bridge", data=bridge_data)
         return format_xml(doc)
 
     logger.warning(f"No dialplan route matched for dest='{dest_number}' in context='{context}'")

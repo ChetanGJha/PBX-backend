@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 from src.core.database import execute_query, execute_query_one
 from src.core.permissions import get_current_user, require_roles, CurrentUser
+from src.services.gateway_sync import execute_esl_command
 
 router = APIRouter(prefix="/queues", tags=["Call Queues"])
 
@@ -83,6 +84,11 @@ async def create_queue(
     data = payload.dict()
     data["tenant_id"] = target_tenant
     row = await execute_query_one(query, data)
+    try:
+        execute_esl_command("reloadxml")
+        execute_esl_command("reload mod_callcenter")
+    except Exception:
+        pass
     return dict(row)
 
 
@@ -120,6 +126,11 @@ async def update_queue(
         RETURNING id, name, queue_number, strategy, agent_timeout, wrap_up_time, max_wait_time, agents, enabled, created_at::text, tenant_id::text as tenant_id
     """
     row = await execute_query_one(query, params)
+    try:
+        execute_esl_command("reloadxml")
+        execute_esl_command("reload mod_callcenter")
+    except Exception:
+        pass
     return dict(row)
 
 
@@ -143,4 +154,9 @@ async def delete_queue(
         "UPDATE queues SET deleted_at = NOW() WHERE id = CAST(:id AS uuid) RETURNING id",
         {"id": str(queue_id)}
     )
+    try:
+        execute_esl_command("reloadxml")
+        execute_esl_command("reload mod_callcenter")
+    except Exception:
+        pass
     return None

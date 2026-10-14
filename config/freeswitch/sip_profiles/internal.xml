@@ -1,5 +1,7 @@
 <profile name="internal">
   <aliases>
+    <alias name="pbx.terrixai.com"/>
+    <alias name="terrixai.com"/>
     <alias name="pbx.aikyamlabs.local"/>
     <alias name="127.0.0.1"/>
     <alias name="8.234.117.15"/>
