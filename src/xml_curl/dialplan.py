@@ -302,6 +302,92 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SubElement(cond_elem, "action", application="transfer", data=f"1001 XML {context}")
         return format_xml(doc)
 
+    # =========================================================================
+    # SCENARIO: CONFERENCE PIN AUTHENTICATION & EXECUTION
+    # =========================================================================
+    if dest_number.startswith("conf_exec_"):
+        parts = dest_number.replace("conf_exec_", "").split("_", 1)
+        conf_ext = parts[0]
+        entered_pin = parts[1] if len(parts) > 1 else ""
+
+        conf_row = await execute_query_one(
+            """
+            SELECT id, name, extension_number, pin, moderator_pin, max_members,
+                   record_conference, wait_for_moderator, announce_join_leave, tenant_id
+            FROM conferences
+            WHERE (extension_number = :ext OR id::text = :ext) AND enabled = true
+            LIMIT 1
+            """,
+            {"ext": conf_ext}
+        )
+        if conf_row:
+            conf_name = conf_row.get("name") or f"conf_{conf_ext}"
+            c_mod_pin = str(conf_row.get("moderator_pin") or "").strip()
+            c_part_pin = str(conf_row.get("pin") or "").strip()
+            conf_tid = str(conf_row.get("tenant_id") or tenant_id or "")
+            rec_conf = bool(conf_row.get("record_conference"))
+
+            ext_elem = SubElement(context_elem, "extension", name=f"conf_exec_{conf_ext}")
+            cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+            SubElement(cond_elem, "action", application="set", data=f"tenant_id={conf_tid}")
+            SubElement(cond_elem, "action", application="set", data="direction=internal")
+            SubElement(cond_elem, "action", application="answer")
+
+            if rec_conf and conf_tid:
+                rec_path = f"/var/lib/freeswitch/recordings/{conf_tid}/conf_{conf_row['id']}_${{uuid}}.wav"
+                SubElement(cond_elem, "action", application="record_session", data=rec_path)
+
+            if c_mod_pin and entered_pin == c_mod_pin:
+                logger.info(f"Joining conference '{conf_name}' as MODERATOR")
+                SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default+flags{{moderator}}")
+            elif c_part_pin and entered_pin == c_part_pin:
+                logger.info(f"Joining conference '{conf_name}' as PARTICIPANT")
+                SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
+            elif not c_mod_pin and not c_part_pin:
+                logger.info(f"Joining open conference '{conf_name}'")
+                SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
+            else:
+                logger.warning(f"Invalid conference PIN '{entered_pin}' for room '{conf_name}'")
+                SubElement(cond_elem, "action", application="playback", data="conference/conf-bad-pin.wav")
+                SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
+            return format_xml(doc)
+
+    # Dynamic Conference Room Lookup
+    conf_record = await execute_query_one(
+        """
+        SELECT id, name, extension_number, pin, moderator_pin, max_members,
+               record_conference, wait_for_moderator, announce_join_leave, tenant_id
+        FROM conferences
+        WHERE (extension_number = :dest OR id::text = :dest) AND enabled = true
+        LIMIT 1
+        """,
+        {"dest": dest_number}
+    )
+    if conf_record:
+        conf_ext = conf_record.get("extension_number") or dest_number
+        conf_name = conf_record.get("name") or f"conf_{conf_ext}"
+        conf_tid = str(conf_record.get("tenant_id") or tenant_id or "")
+        has_pin = bool(conf_record.get("pin") or conf_record.get("moderator_pin"))
+
+        ext_elem = SubElement(context_elem, "extension", name=f"conf_entry_{conf_ext}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={conf_tid}")
+        SubElement(cond_elem, "action", application="set", data="direction=internal")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+
+        if has_pin:
+            SubElement(
+                cond_elem,
+                "action",
+                application="play_and_get_digits",
+                data="1 10 3 5000 # conference/conf-pin.wav tone_stream://%(500,0,1000) entered_conf_pin \\d+"
+            )
+            SubElement(cond_elem, "action", application="transfer", data=f"conf_exec_{conf_ext}_${{entered_conf_pin}} XML {context}")
+        else:
+            SubElement(cond_elem, "action", application="transfer", data=f"conf_exec_{conf_ext}_none XML {context}")
+        return format_xml(doc)
+
     # Dynamic Hunt Group Lookup from Database
     hg_query = """
         SELECT id, name, extension_number, strategy, members, timeout, tenant_id
