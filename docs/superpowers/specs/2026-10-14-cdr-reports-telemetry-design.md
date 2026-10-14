@@ -6,6 +6,7 @@ This specification covers Sub-Project 2 of the telephony improvements:
 2. **Call Direction & Recording Linking**: Ensure every call record specifies `direction` (`inbound`, `outbound`, `internal`) and links to `recordings` for audio playback.
 3. **Disposition Summary & Filtered Reports**: Provide a dedicated Disposition Summary tab with visual KPI metric cards (Answered, No Answer, Busy, Failed, Answer Rate %) and breakdown tables, plus a Call Direction filter on Call Detail Records.
 4. **Dashboard Telemetry Fix**: Ensure Dashboard widgets (Traffic Summary, Traffic Peak, and Live Calls) display accurate real-time telemetry from database records and FreeSWITCH status.
+5. **Real-Time WebSocket Streaming**: Establish a real-time WebSocket connection (`/ws/reports`) so that completed calls, disposition stats, and dashboard metrics update instantly without requiring manual page refreshes.
 
 ---
 
@@ -19,13 +20,16 @@ flowchart TD
     Parser -->|Check Audio on Disk| Disk["/var/lib/freeswitch/recordings/..."]
     Parser -->|Insert Recording| RecDB[(public.recordings)]
     Parser -->|Insert CDR with direction & recording_id| CdrDB[(public.cdr)]
+    Parser -->|Broadcast Event| WSManager[WebSocket ConnectionManager]
     
     ReportsAPI["/api/v1/reports/*"] -->|Read CDRs & Dispositions| CdrDB
     DashboardAPI["/api/v1/reports/dashboard-metrics"] -->|Traffic Summary & Peak| CdrDB
     DashboardAPI -->|Live Channel Count| ESL[FreeSWITCH ESL]
     
     UIReports[ReportsView.tsx] -->|Fetch Reports & Playback Stream| ReportsAPI
+    UIReports <-->|Live CDR & Disposition Updates| WSManager
     UIDashboard[DashboardView.tsx] -->|Fetch Telemetry| DashboardAPI
+    UIDashboard <-->|Live Metric Updates| WSManager
 ```
 
 ---
@@ -94,10 +98,41 @@ flowchart TD
    - Add `getDispositionSummaryReport(token, tenantId?, startDate?, endDate?, callType?)`.
    - Update `getCdrReport` to accept `callType` and `disposition`.
 
+### 3.5 WebSocket Real-Time Monitoring Subsystem
+- **Endpoint**: `/ws/reports` (handled by FastAPI WebSocket router at `/ws/reports`).
+- **Connection Management**:
+  - `ConnectionManager` manages active client WebSockets with tenant authorization.
+  - Clients pass JWT `token` via query string `?token=...`.
+  - Super-admins receive all tenant events; tenant-scoped users receive events for their `tenant_id`.
+- **Event Schemas**:
+  - `cdr.created`: Triggered immediately after a new call is ingested.
+    ```json
+    {
+      "event": "cdr.created",
+      "data": {
+        "id": "uuid",
+        "call_uuid": "...",
+        "direction": "inbound",
+        "caller_number": "1001",
+        "destination": "1002",
+        "duration": 45,
+        "billsec": 42,
+        "hangup_cause": "NORMAL_CLEARING",
+        "recording_id": "rec-uuid",
+        "tenant_id": "tenant-uuid"
+      }
+    }
+    ```
+  - `telemetry.updated`: Sent periodically or on call events to trigger dashboard re-sync.
+- **Frontend Live Hook**:
+  - `ReportsView.tsx`: Subscribes to `/ws/reports`. On `cdr.created`, automatically prepends new record to the active view and increments disposition counts without requiring manual page refresh.
+  - `DashboardView.tsx`: Subscribes to `/ws/reports`. On `cdr.created` or `telemetry.updated`, re-fetches dashboard metrics to keep Traffic Summary and Peak concurrency up to date.
+
 ---
 
 ## 4. Verification Plan
 - Unit test XML CDR parser with sample FreeSWITCH XML CDR payloads (inbound, outbound, internal).
 - Unit test disposition summary and CDR filter queries.
+- Unit test WebSocket connection manager and broadcast mechanism.
 - FreeSWITCH live verification: reload XML, verify `module_exists mod_xml_cdr` is true.
 - Frontend build verification (`npm run build`).
