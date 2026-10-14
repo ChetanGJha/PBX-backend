@@ -483,41 +483,70 @@ async def handle_voicemail_webhook(request: Request):
         logger.info(f"Voicemail webhook received: ext={extension_number}, caller={caller_id_number}, file={file_path}")
 
         # 1. Lookup Extension and Email
-        ext_row = await execute_query_one(
-            """
-            SELECT e.id, e.email, e.display_name, t.name as tenant_name
-            FROM extensions e
-            JOIN tenants t ON e.tenant_id = t.id
-            WHERE e.extension_number = :ext AND e.tenant_id = CAST(:tid AS uuid)
-            """,
-            {"ext": extension_number, "tid": tenant_id}
-        )
-        recipient_email = "alice@acme.com"
-        ext_id = None
-        if ext_row:
-            ext_id = str(ext_row["id"])
-            recipient_email = ext_row.get("email") or recipient_email
+        if tenant_id:
+            ext_row = await execute_query_one(
+                """
+                SELECT e.id, e.email, e.display_name, e.tenant_id, t.name as tenant_name
+                FROM extensions e
+                JOIN tenants t ON e.tenant_id = t.id
+                WHERE e.extension_number = :ext AND e.tenant_id = CAST(:tid AS uuid)
+                """,
+                {"ext": extension_number, "tid": tenant_id}
+            )
+        else:
+            ext_row = await execute_query_one(
+                """
+                SELECT e.id, e.email, e.display_name, e.tenant_id, t.name as tenant_name
+                FROM extensions e
+                JOIN tenants t ON e.tenant_id = t.id
+                WHERE e.extension_number = :ext
+                ORDER BY e.created_at ASC
+                LIMIT 1
+                """,
+                {"ext": extension_number}
+            )
+
+        if not ext_row:
+            logger.warning(f"Voicemail webhook aborted: extension {extension_number} not found in database.")
+            return {"status": "error", "detail": f"Extension {extension_number} not found"}
+
+        ext_id = str(ext_row["id"])
+        effective_tenant_id = str(ext_row.get("tenant_id") or tenant_id or "")
+        recipient_email = ext_row.get("email") or "voicemail@pbx.local"
 
         # 2. Get or Create Voicemail Box
-        vm_box = None
-        if ext_id:
-            vm_box = await execute_query_one(
-                "SELECT id FROM voicemail_boxes WHERE extension_id = CAST(:ext_id AS uuid)",
-                {"ext_id": ext_id}
-            )
-        if not vm_box and ext_id:
+        vm_box = await execute_query_one(
+            """
+            SELECT id FROM voicemail_boxes 
+            WHERE extension_id = CAST(:ext_id AS uuid)
+               OR (tenant_id = CAST(:tid AS uuid) AND mailbox = :mailbox)
+            LIMIT 1
+            """,
+            {"ext_id": ext_id, "tid": effective_tenant_id, "mailbox": extension_number}
+        )
+        if not vm_box:
             vm_box_id = str(uuid4())
             await execute_query(
                 """
                 INSERT INTO voicemail_boxes (id, tenant_id, extension_id, mailbox, email_notification, email_address)
                 VALUES (CAST(:id AS uuid), CAST(:tid AS uuid), CAST(:ext_id AS uuid), :mailbox, true, :email)
+                ON CONFLICT (tenant_id, mailbox) DO UPDATE 
+                SET extension_id = EXCLUDED.extension_id, email_address = COALESCE(EXCLUDED.email_address, voicemail_boxes.email_address)
                 """,
-                {"id": vm_box_id, "tid": tenant_id, "ext_id": ext_id, "mailbox": extension_number, "email": recipient_email}
+                {"id": vm_box_id, "tid": effective_tenant_id, "ext_id": ext_id, "mailbox": extension_number, "email": recipient_email}
             )
-        elif vm_box:
-            vm_box_id = str(vm_box["id"])
+            vm_box = await execute_query_one(
+                "SELECT id FROM voicemail_boxes WHERE tenant_id = CAST(:tid AS uuid) AND mailbox = :mailbox",
+                {"tid": effective_tenant_id, "mailbox": extension_number}
+            )
+            vm_box_id = str(vm_box["id"]) if vm_box else vm_box_id
         else:
-            vm_box_id = str(uuid4())
+            vm_box_id = str(vm_box["id"])
+            if str(vm_box.get("extension_id")) != ext_id:
+                await execute_query(
+                    "UPDATE voicemail_boxes SET extension_id = CAST(:ext_id AS uuid) WHERE id = CAST(:id AS uuid)",
+                    {"ext_id": ext_id, "id": vm_box_id}
+                )
 
         # 3. Insert into voicemail_messages
         msg_id = str(uuid4())
@@ -537,7 +566,7 @@ async def handle_voicemail_webhook(request: Request):
                 caller_id_name=caller_id_name,
                 file_path=file_path,
                 duration=duration,
-                tenant_id=tenant_id
+                tenant_id=effective_tenant_id
             )
         )
 
@@ -549,7 +578,7 @@ async def handle_voicemail_webhook(request: Request):
                 "caller_id_name": caller_id_name,
                 "caller_id_number": caller_id_number,
                 "duration": duration,
-                "tenant_id": tenant_id
+                "tenant_id": effective_tenant_id
             })
         )
 
