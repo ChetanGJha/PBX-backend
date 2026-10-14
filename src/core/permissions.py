@@ -18,7 +18,7 @@ class CurrentUser:
 
     @property
     def is_super_admin(self) -> bool:
-        return self.role == "SUPER_ADMIN"
+        return str(self.role).upper() == "SUPER_ADMIN"
 
 
 async def get_current_user(

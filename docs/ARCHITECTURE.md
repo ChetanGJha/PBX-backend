@@ -297,14 +297,29 @@ Tenant security is strictly enforced at every architectural layer:
 
 ---
 
-## 9. SIP/WebRTC Architecture
+## 9. SIP/WebRTC Architecture & Multi-Homed Topology
 
-### Sofia SIP Profiles
-- **`internal` Profile (Port 5060 TCP/UDP)**: Serves standard desktop/hardware SIP phones. Uses TLS on 5061.
-- **`external` Profile (Port 5080 TCP/UDP)**: Dedicated to carrier SIP trunks and DID termination.
-- **`webrtc` Profile (Port 7443 WSS / 5066 WS)**:
-  - Enabled features: `ws-binding`, `wss-binding`, `enable-media-encryption=true` (DTLS-SRTP), `insecure=true` (for STUN/ICE resolution behind NAT).
-  - Supported codecs: `opus`, `G722`, `PCMU`, `PCMA`.
+### Multi-Homed Sofia SIP Profiles
+FreeSWITCH is configured in a multi-homed edge architecture to cleanly segment public internet VoIP traffic from private fiber cross-connect / leased-line interconnects:
+
+1. **`internal` Profile (Ports 5060 TCP/UDP, 5061 TLS)**:
+   - **Binding**: Internal enterprise endpoints, desktop hardphones, and office softphones.
+   - **Authentication**: Mandatory SIP Digest Authentication against dynamic tenant credentials fetched via `mod_xml_curl` directory service.
+   - **Context**: Binds authenticated callers to their isolated `tenant-{tenant_id}` dialplan context.
+
+2. **`external` Profile (Port 5080 TCP/UDP)**:
+   - **Binding**: Public internet carrier SIP trunks (e.g., `ISHAN_ITS`, Telnyx, Twilio).
+   - **Context**: `public` context. Matches incoming DIDs against the `dids` table to identify target tenants.
+   - **NAT Handling**: Aggressive NAT traversal and STUN/ICE handling for external SIP providers over public IPv4/IPv6.
+
+3. **`external-crossconnect` Profile (Port 5090 TCP/UDP)**:
+   - **Binding**: Dedicated carrier fiber cross-connects, MPLS VPNs, and peering interconnects (e.g., `ISHAN_FL`).
+   - **Context**: `public` context.
+   - **Isolation**: Bypasses public NAT traversal routines; uses deterministic point-to-point IP routing and dedicated SIP interface parameters, ensuring zero jitter and sub-millisecond signaling latency.
+
+4. **`webrtc` Profile (Port 7443 WSS / 5066 WS)**:
+   - **Enabled features**: `ws-binding`, `wss-binding`, `enable-media-encryption=true` (DTLS-SRTP), ICE candidate negotiation.
+   - **Supported codecs**: `opus`, `G722`, `PCMU`, `PCMA`.
 
 ---
 
@@ -318,7 +333,7 @@ Tenant security is strictly enforced at every architectural layer:
 5. XML response executes `bridge(user/1002@tenant-a.example.com)`.
 
 ### B. Inbound Call Routing (Carrier DID -> IVR -> Ring Group -> Extension / Voicemail)
-1. Carrier sends INVITE to DID `+18005550199`.
+1. Carrier sends INVITE to DID `+18005550199` on Port 5080 or Port 5090.
 2. FreeSWITCH receives call on `public` context.
 3. XML-CURL maps `+18005550199` to `dids` table -> Tenant A.
 4. Checks Business Hours table (Open vs Closed vs Holiday).
@@ -328,7 +343,35 @@ Tenant security is strictly enforced at every architectural layer:
 
 ---
 
-## 11. Recording Architecture
+## 11. Voicemail & Custom Audio Prompt Pipeline
+
+The platform features an automated voicemail recording, greeting, and notification subsystem:
+
+```
+ Caller unanswered / busy
+          │
+          ▼
+ Dialplan Voicemail Block
+   - answer() & sleep(500)
+   - playback(custom_greeting.wav OR synthesized TTS prompt)
+   - playback(tone_stream://%(1000,0,1000)) [1000Hz Beep]
+   - record(/app/recordings/voicemails/{tenant_id}/{mailbox}/{uuid}.wav 120 20 2)
+   - api_hangup_hook triggers /freeswitch/voicemail webhook
+          │
+          ▼
+ FastAPI /freeswitch/voicemail Webhook
+   - Idempotently creates or updates voicemail_boxes record
+   - Creates voicemail_messages record (uuid, duration, caller_id, file_path)
+   - Sends real-time WebSocket notification (broadcast_voicemail_created)
+   - Dispatches background email with audio attachment (send_voicemail_notification)
+```
+
+- **Custom Prompt Management**: Tenant administrators can upload pre-recorded WAV/MP3 greetings via `POST /api/v1/audio/upload` or synthesize dynamic text-to-speech greetings.
+- **Audio Delivery**: Voicemails and audio prompts are streamed securely to authenticated frontends with HTTP `Accept-Ranges: bytes` support via `GET /api/v1/reports/voicemail/{id}/audio` and `GET /api/v1/audio/{id}/stream`.
+
+---
+
+## 12. Recording Architecture
 
 - **Engine Level**: Triggered in dialplan via `record_session` or ESL `uuid_record`.
 - **Policy Hierarchy**: Resolution order: `Call > Extension > Queue > Tenant > Platform`.
@@ -339,17 +382,59 @@ Tenant security is strictly enforced at every architectural layer:
 
 ---
 
-## 12. CDR Architecture
+## 13. Dual-Pipeline CDR & Real-Time Telemetry Architecture
 
-- **Event Driven**: Listens to FreeSWITCH `CHANNEL_HANGUP_COMPLETE` events via custom async TCP ESL socket listener.
-- **Metrics Calculation**:
-  - `duration`: `end_time - start_time`
-  - `billsec`: `end_time - answer_time` (0 if un-answered)
-- **Database Persistence**: Written directly into `cdr` table with indexed fields (`tenant_id`, `call_uuid`, `start_time`, `caller_number`, `destination`, `hangup_cause`).
+The platform employs a redundant dual-ingestion architecture to guarantee 100% CDR capture reliability and real-time dashboard telemetry:
+
+```
+                    FreeSWITCH Media Engine
+                   ┌────────────────────────┐
+                   │ Channel Hangup Event   │
+                   └───────────┬────────────┘
+                               │
+             ┌─────────────────┴─────────────────┐
+             │                                   │
+             ▼                                   ▼
+   [Primary: mod_xml_cdr]               [Fallback: ESL Engine]
+   HTTP POST /freeswitch/cdr            TCP Event Socket (:8021)
+   Full XML Call Detail Record          CHANNEL_HANGUP_COMPLETE
+             │                                   │
+             └─────────────────┬─────────────────┘
+                               │
+                               ▼
+                    FastAPI Ingestion Engine
+                   ┌────────────────────────┐
+                   │ XML/JSON Normalization │
+                   │ DB Upsert (cdr table)  │
+                   └───────────┬────────────┘
+                               │
+             ┌─────────────────┴─────────────────┐
+             │                                   │
+             ▼                                   ▼
+   PostgreSQL Persistence              WebSocket Telemetry Hub
+   - cdr table (indexed)               - /ws/reports (Real-Time Metrics)
+   - Historical search & filters       - /ws/events (Live Channel State)
+   - CSV / Excel export                - Instant badge & KPI updates
+```
+
+### Ingestion Pipelines
+1. **Primary Pipeline (`mod_xml_cdr`)**:
+   - FreeSWITCH serializes the entire channel state, variables, timing metrics (`start_epoch`, `answer_epoch`, `end_epoch`, `duration`, `billsec`), quality stats, and hangup causes into XML and POSTs directly to `/freeswitch/cdr`.
+   - The FastAPI endpoint parses the payload using `xmltodict`, computes billing metrics, stores the record in PostgreSQL, and immediately triggers WebSocket push.
+2. **Fallback Pipeline (Async ESL TCP Client)**:
+   - Python asyncio ESL listener maintains an active inbound socket connection to FreeSWITCH on port 8021.
+   - Listens for `CHANNEL_HANGUP_COMPLETE` and `RECORD_STOP` events to ensure CDR capture if HTTP delivery experiences intermittent network delays.
+
+### Real-Time WebSocket Telemetry (`/ws/reports` & `/ws/events`)
+- **Connection Management**: Managed by `WebSocketManager` with tenant-isolated connection sets (`Dict[UUID, Set[WebSocket]]`).
+- **Real-Time Push Events**:
+  - `broadcast_cdr_created(tenant_id, cdr)`: Pushes new call records instantly to connected dashboard clients, updating KPI counters (Total Calls, Answered, Abandoned, Total Billsec, ASR, ACD) in real time without browser polling.
+  - `broadcast_voicemail_created(tenant_id, vm)`: Updates voicemail counters and injects new voicemail records dynamically into the interactive UI.
+  - `broadcast_channel_event(tenant_id, event)`: Streams live call channel states (RINGING, ANSWERED, HANGUP) for real-time wallboard monitoring.
 
 ---
 
-## 13. High Availability (HA) Architecture
+## 14. High Availability (HA) Architecture
 
 ### Multi-Node FreeSWITCH Active-Active Topology
 ```
@@ -378,7 +463,7 @@ Tenant security is strictly enforced at every architectural layer:
 
 ---
 
-## 14. Security Architecture
+## 15. Security Architecture
 
 1. **Authentication**: JWT tokens signed with SHA-256 with 15-minute access token expiry & 7-day refresh tokens.
 2. **SIP Security**: SIP digest authentication for all endpoints. Random, strong passwords generated per extension.
@@ -388,7 +473,7 @@ Tenant security is strictly enforced at every architectural layer:
 
 ---
 
-## 15. Development Roadmap (Phases 1 - 12)
+## 16. Development Roadmap Status
 
 - **Phase 1**: Architecture & Core Schema Setup (Current Phase)
 - **Phase 2**: Authentication, RBAC, Tenant Management, Extension Management, Dynamic `mod_xml_curl` Directory

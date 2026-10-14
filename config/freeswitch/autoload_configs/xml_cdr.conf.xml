@@ -1,0 +1,10 @@
+<configuration name="xml_cdr.conf" description="XML CDR Module">
+  <settings>
+    <param name="url" value="http://api:8000/freeswitch/cdr"/>
+    <param name="retries" value="3"/>
+    <param name="delay" value="5"/>
+    <param name="log-b-leg" value="false"/>
+    <param name="prefix-a-leg" value="false"/>
+    <param name="encode" value="true"/>
+  </settings>
+</configuration>

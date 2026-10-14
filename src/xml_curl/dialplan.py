@@ -1,3 +1,4 @@
+import os
 import logging
 import socket
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -23,35 +24,8 @@ VOICEMAIL_CONTINUE_ON_FAIL = (
 )
 
 
-def check_registered_domain(ext_num: str, candidate_domains: List[str]) -> Optional[str]:
-    """
-    Directly queries FreeSWITCH mod_event_socket to find where an extension is actively registered.
-    Returns the exact registered domain (e.g. '127.0.0.1' or 'pbx.aikyamlabs.local') or None if offline.
-    """
-    try:
-        s = socket.socket()
-        s.settimeout(1.0)
-        s.connect(('freeswitch', 8021))
-        s.recv(1024)
-        s.sendall(b'auth ClueCon\n\n')
-        s.recv(1024)
-        for dom in candidate_domains:
-            s.sendall(f'api sofia_contact */{ext_num}@{dom}\n\n'.encode())
-            data = ""
-            while True:
-                chunk = s.recv(1024).decode('utf-8', errors='ignore')
-                if not chunk:
-                    break
-                data += chunk
-                if "error/user_not_registered" in data or "sofia/internal" in data:
-                    break
-            if "error/user_not_registered" not in data and "sofia/internal" in data:
-                s.close()
-                return dom
-        s.close()
-    except Exception as e:
-        logger.warning(f"Error checking sofia registration for {ext_num}: {e}")
-    return None
+# Native FreeSWITCH Sofia handles user registration lookups directly via user/${ext_num}@${domain}
+# No brittle socket pre-checks needed.
 
 
 async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
@@ -329,6 +303,92 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SubElement(cond_elem, "action", application="transfer", data=f"1001 XML {context}")
         return format_xml(doc)
 
+    # =========================================================================
+    # SCENARIO: CONFERENCE PIN AUTHENTICATION & EXECUTION
+    # =========================================================================
+    if dest_number.startswith("conf_exec_"):
+        parts = dest_number.replace("conf_exec_", "").split("_", 1)
+        conf_ext = parts[0]
+        entered_pin = parts[1] if len(parts) > 1 else ""
+
+        conf_row = await execute_query_one(
+            """
+            SELECT id, name, extension_number, pin, moderator_pin, max_members,
+                   record_conference, wait_for_moderator, announce_join_leave, tenant_id
+            FROM conferences
+            WHERE (extension_number = :ext OR id::text = :ext) AND enabled = true
+            LIMIT 1
+            """,
+            {"ext": conf_ext}
+        )
+        if conf_row:
+            conf_name = conf_row.get("name") or f"conf_{conf_ext}"
+            c_mod_pin = str(conf_row.get("moderator_pin") or "").strip()
+            c_part_pin = str(conf_row.get("pin") or "").strip()
+            conf_tid = str(conf_row.get("tenant_id") or tenant_id or "")
+            rec_conf = bool(conf_row.get("record_conference"))
+
+            ext_elem = SubElement(context_elem, "extension", name=f"conf_exec_{conf_ext}")
+            cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+            SubElement(cond_elem, "action", application="set", data=f"tenant_id={conf_tid}")
+            SubElement(cond_elem, "action", application="set", data="direction=internal")
+            SubElement(cond_elem, "action", application="answer")
+
+            if rec_conf and conf_tid:
+                rec_path = f"/var/lib/freeswitch/recordings/{conf_tid}/conf_{conf_row['id']}_${{uuid}}.wav"
+                SubElement(cond_elem, "action", application="record_session", data=rec_path)
+
+            if c_mod_pin and entered_pin == c_mod_pin:
+                logger.info(f"Joining conference '{conf_name}' as MODERATOR")
+                SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default+flags{{moderator}}")
+            elif c_part_pin and entered_pin == c_part_pin:
+                logger.info(f"Joining conference '{conf_name}' as PARTICIPANT")
+                SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
+            elif not c_mod_pin and not c_part_pin:
+                logger.info(f"Joining open conference '{conf_name}'")
+                SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
+            else:
+                logger.warning(f"Invalid conference PIN '{entered_pin}' for room '{conf_name}'")
+                SubElement(cond_elem, "action", application="playback", data="conference/conf-bad-pin.wav")
+                SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
+            return format_xml(doc)
+
+    # Dynamic Conference Room Lookup
+    conf_record = await execute_query_one(
+        """
+        SELECT id, name, extension_number, pin, moderator_pin, max_members,
+               record_conference, wait_for_moderator, announce_join_leave, tenant_id
+        FROM conferences
+        WHERE (extension_number = :dest OR id::text = :dest) AND enabled = true
+        LIMIT 1
+        """,
+        {"dest": dest_number}
+    )
+    if conf_record:
+        conf_ext = conf_record.get("extension_number") or dest_number
+        conf_name = conf_record.get("name") or f"conf_{conf_ext}"
+        conf_tid = str(conf_record.get("tenant_id") or tenant_id or "")
+        has_pin = bool(conf_record.get("pin") or conf_record.get("moderator_pin"))
+
+        ext_elem = SubElement(context_elem, "extension", name=f"conf_entry_{conf_ext}")
+        cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+        SubElement(cond_elem, "action", application="set", data=f"tenant_id={conf_tid}")
+        SubElement(cond_elem, "action", application="set", data="direction=internal")
+        SubElement(cond_elem, "action", application="answer")
+        SubElement(cond_elem, "action", application="sleep", data="500")
+
+        if has_pin:
+            SubElement(
+                cond_elem,
+                "action",
+                application="play_and_get_digits",
+                data="1 10 3 5000 # conference/conf-pin.wav tone_stream://%(500,0,1000) entered_conf_pin \\d+"
+            )
+            SubElement(cond_elem, "action", application="transfer", data=f"conf_exec_{conf_ext}_${{entered_conf_pin}} XML {context}")
+        else:
+            SubElement(cond_elem, "action", application="transfer", data=f"conf_exec_{conf_ext}_none XML {context}")
+        return format_xml(doc)
+
     # Dynamic Hunt Group Lookup from Database
     hg_query = """
         SELECT id, name, extension_number, strategy, members, timeout, tenant_id
@@ -349,12 +409,19 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             "tenant_id": tenant_id
         }
 
-    if hunt_group:
+    if hunt_group and isinstance(hunt_group, dict) and hunt_group.get("name"):
         hg_name = hunt_group["name"]
         hg_timeout = hunt_group.get("timeout") or 25
         raw_members = hunt_group.get("members") or ""
         hg_tenant_id = hunt_group.get("tenant_id") or tenant_id
-        logger.info(f"Routing to Hunt Group '{hg_name}' (ext {dest_number}) with members: {raw_members}")
+        if hg_tenant_id:
+            t_row = await execute_query_one(
+                "SELECT sip_domain FROM tenants WHERE id = CAST(:tid AS uuid) AND deleted_at IS NULL",
+                {"tid": str(hg_tenant_id)}
+            )
+            if t_row and t_row.get("sip_domain"):
+                domain_name = t_row["sip_domain"]
+        logger.info(f"Routing to Hunt Group '{hg_name}' (ext {dest_number}) with members: {raw_members} domain: {domain_name}")
 
         # Parse member extensions: strip whitespace and any domain part (e.g. 1001@pbx.aikyamlabs.local -> 1001)
         member_list = []
@@ -382,11 +449,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
         SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
 
-        candidate_domains = list(dict.fromkeys(["127.0.0.1", domain_name, "pbx.aikyamlabs.local"]))
-        bridge_endpoints = []
-        for m_ext in member_list:
-            active_dom = check_registered_domain(m_ext, candidate_domains) or domain_name
-            bridge_endpoints.append(f"user/{m_ext}@{active_dom}")
+        bridge_endpoints = [f"user/{m_ext}@{domain_name}" for m_ext in member_list]
 
         if bridge_endpoints:
             # Simultaneous bridge strategy rings all member endpoints together
@@ -455,9 +518,31 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/{target}@{domain_name}")
             add_voicemail_block(cond_elem, target, domain_name, tenant_id)
         elif dest_type == "queue":
-            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=20]user/1001@{domain_name},user/1002@{domain_name}")
+            SubElement(cond_elem, "action", application="answer")
+            SubElement(cond_elem, "action", application="callcenter", data=target)
         elif dest_type == "hunt_group":
-            SubElement(cond_elem, "action", application="transfer", data=f"{target or '8888'} XML {context}")
+            hg_row = await execute_query_one(
+                """
+                SELECT id, name, extension_number, strategy, members, timeout, tenant_id
+                FROM hunt_groups
+                WHERE (extension_number = :t OR id::text = :t) AND enabled = true AND deleted_at IS NULL
+                LIMIT 1
+                """,
+                {"t": target}
+            )
+            if hg_row:
+                raw_m = hg_row.get("members") or ""
+                hg_to = hg_row.get("timeout") or 25
+                m_list = [m.split("@")[0].strip() for m in raw_m.split(",") if m.strip()]
+                b_endpoints = [f"user/{m_ext}@{domain_name}" for m_ext in m_list if m_ext]
+                if b_endpoints:
+                    SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout={hg_to}]" + ",".join(b_endpoints))
+                fallback_ext = m_list[0] if m_list else "1001"
+                add_voicemail_block(cond_elem, fallback_ext, domain_name, tenant_id)
+            else:
+                SubElement(cond_elem, "action", application="transfer", data=f"{target or '8888'} XML {context}")
+        elif dest_type == "conference":
+            SubElement(cond_elem, "action", application="transfer", data=f"{target} XML {context}")
         elif dest_type == "ivr":
             SubElement(cond_elem, "action", application="transfer", data=f"{target or '6001'} XML {context}")
         elif dest_type == "voicemail":
@@ -484,6 +569,20 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     if target_ext:
         ext_num = target_ext["extension_number"]
         callee_domain = target_ext.get("sip_domain") or domain_name
+
+        # Check tenant policy for internal calling
+        tenant_row = await execute_query_one(
+            "SELECT allow_internal_calls FROM tenants WHERE id = CAST(:tid AS uuid)",
+            {"tid": tenant_id}
+        )
+        allow_internal = tenant_row.get("allow_internal_calls") if tenant_row else True
+        if allow_internal is False:
+            logger.info(f"Internal extension calling disabled for tenant {tenant_id}. Rejecting call to {ext_num}")
+            ext_elem = SubElement(context_elem, "extension", name=f"reject_internal_{ext_num}")
+            cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=f"^{ext_num}$")
+            SubElement(cond_elem, "action", application="respond", data="403 Forbidden - Internal Calling Disabled")
+            SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
+            return format_xml(doc)
 
         # Check Call Forwarding
         cf_record = await execute_query_one(
@@ -557,18 +656,10 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             logger.info(f"Extension {ext_num} has unconditional forward to {cf_dest}")
             SubElement(cond_elem, "action", application="transfer", data=f"{cf_dest} XML {context}")
         else:
-            # Query FreeSWITCH to check if and where the callee extension is actively registered
-            candidate_domains = list(dict.fromkeys(["127.0.0.1", callee_domain, "pbx.aikyamlabs.local"]))
-            active_domain = check_registered_domain(ext_num, candidate_domains)
-
-            if active_domain:
-                logger.info(f"Callee {ext_num} is actively registered on {active_domain}. Bridging with timeout={timeout}s...")
-                bridge_opts = f"{{ignore_early_media=true,originate_timeout={timeout},call_timeout={timeout},leg_timeout={timeout}}}"
-                SubElement(cond_elem, "action", application="bridge", data=f"{bridge_opts}user/{ext_num}@{active_domain}")
-                SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
-            else:
-                logger.info(f"Callee {ext_num} is offline (unregistered). Routing to failover target: {fail_target}.")
-                SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
+            logger.info(f"Bridging internal call to user/{ext_num}@{callee_domain} with timeout={timeout}s...")
+            bridge_opts = f"{{ignore_early_media=true,originate_timeout={timeout},call_timeout={timeout},leg_timeout={timeout},continue_on_fail=true}}"
+            SubElement(cond_elem, "action", application="bridge", data=f"{bridge_opts}user/{ext_num}@{callee_domain}")
+            SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
 
         # Declare the forward-on-no-answer extension in context if enabled
         if has_fwd_no_answer:
@@ -743,12 +834,12 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     return NOT_FOUND_XML
 
 
-def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str):
+def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id: str, custom_greeting_path: Optional[str] = None):
     """
     Appends full Voicemail execution actions:
     1. Answers the channel
     2. Sets channel variables for CDR fallback logging
-    3. Plays 'User not available, please leave a voicemail' greeting
+    3. Plays custom or synthesized 'User not available, please leave a voicemail' greeting
     4. Plays 1000Hz beep tone
     5. Records caller's audio message to disk
     6. Calls API webhook to record to database and queue email dispatch
@@ -769,8 +860,12 @@ def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id
     SubElement(cond_elem, "action", application="set", data=f"api_hangup_hook=curl {curl_url} post")
     SubElement(cond_elem, "action", application="set", data="session_in_hangup_hook=true")
 
-    # Play customized Voicemail Prompt ("User at extension {ext_num} is not available, please leave a voice message after the beep")
-    prompt_path = ensure_voicemail_prompt(ext_num)
+    # Resolve greeting audio prompt: custom uploaded audio file or synthesized dynamic prompt
+    if custom_greeting_path and os.path.exists(custom_greeting_path):
+        prompt_path = custom_greeting_path
+    else:
+        prompt_path = ensure_voicemail_prompt(ext_num)
+
     SubElement(cond_elem, "action", application="playback", data=prompt_path)
     # Play Beep Tone (native FreeSWITCH 1000Hz tone for 500ms)
     SubElement(cond_elem, "action", application="playback", data="tone_stream://%(500,0,1000)")

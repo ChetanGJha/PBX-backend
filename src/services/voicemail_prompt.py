@@ -16,7 +16,10 @@ def ensure_voicemail_prompt(ext_num: str) -> str:
 
     Returns the absolute path to the 8kHz mono WAV audio file for FreeSWITCH playback.
     """
-    os.makedirs(PROMPTS_DIR, exist_ok=True)
+    try:
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
+    except OSError:
+        pass
     target_wav = os.path.join(PROMPTS_DIR, f"voicemail_{ext_num}.wav")
 
     # If the customized prompt already exists and is non-empty, use it

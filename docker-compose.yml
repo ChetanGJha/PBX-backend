@@ -58,6 +58,7 @@ services:
         condition: service_healthy
     volumes:
       - ./src:/app/src
+      - ./tests:/app/tests
       - ./migrations:/app/migrations
       - ./config/freeswitch:/etc/freeswitch
       - recording_storage:/var/lib/freeswitch/recordings

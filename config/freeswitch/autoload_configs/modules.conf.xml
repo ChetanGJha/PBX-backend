@@ -26,6 +26,7 @@
     <load module="mod_loopback"/>
     <load module="mod_commands"/>
     <load module="mod_conference"/>
+    <load module="mod_callcenter"/>
     <load module="mod_voicemail"/>
     <load module="mod_valet_parking"/>
     <load module="mod_hash"/>
@@ -33,5 +34,6 @@
     <load module="mod_expr"/>
     <load module="mod_curl"/>
     <load module="mod_json_cdr"/>
+    <load module="mod_xml_cdr"/>
   </modules>
 </configuration>

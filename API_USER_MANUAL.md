@@ -375,3 +375,205 @@ curl -X GET http://localhost:8000/health
 ```bash
 curl -X GET http://localhost:8000/ready
 ```
+
+---
+
+## 7. Call Detail Records (CDR) & Real-Time Reports
+
+### CDR Query & Analytics
+- **Endpoint**: `GET /api/v1/reports/cdr`
+- **Query Parameters**:
+  - `tenant_id`: (Super Admin only) filter by tenant UUID
+  - `start_date`: `YYYY-MM-DD`
+  - `end_date`: `YYYY-MM-DD`
+  - `direction`: `inbound` | `outbound` | `internal` | `all`
+  - `disposition`: `ANSWERED` | `NO_ANSWER` | `BUSY` | `FAILED` | `all`
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/reports/cdr?direction=inbound&disposition=ANSWERED" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### Disposition Summary KPI Analytics
+- **Endpoint**: `GET /api/v1/reports/disposition-summary`
+- **Query Parameters**: `tenant_id`, `start_date`, `end_date`, `direction`
+- **Response**: Aggregated counts for `total_calls`, `answered`, `no_answer`, `busy`, `failed`, `answer_rate_pct`, and detailed hangup cause breakdown.
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/reports/disposition-summary" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### FreeSWITCH mod_xml_cdr Webhook
+- **Endpoint**: `POST /freeswitch/cdr`
+- FreeSWITCH automatically posts complete XML CDR records upon call completion. The backend normalizes variables, determines call direction, computes billable seconds, updates PostgreSQL `cdrs`, and broadcasts real-time events over WebSockets.
+
+---
+
+## 8. Voicemail Subsystem & Reports
+
+### Fetch Voicemail Report & Messages
+- **Endpoint**: `GET /api/v1/reports/voicemail`
+- **Query Parameters**:
+  - `extension_number`: Filter by extension
+  - `is_read`: `true` | `false`
+  - `start_date` / `end_date`: Date range filters
+- **Response**: Summary counts (`total_messages`, `unread_messages`, `total_duration_seconds`) and itemized message list.
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/reports/voicemail" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### Stream Voicemail Audio
+- **Endpoint**: `GET /api/v1/reports/voicemail/{message_id}/audio`
+- Streams the 8kHz mono WAV voice message with `Accept-Ranges: bytes` support for in-browser playback.
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/reports/voicemail/<message_id>/audio" \
+  -H "Authorization: Bearer <access_token>" \
+  -o voicemail.wav
+```
+
+### Mark Voicemail Read / Unread
+- **Endpoint**: `PATCH /api/v1/reports/voicemail/{message_id}/read?read=true`
+
+```bash
+curl -X PATCH "http://localhost:8000/api/v1/reports/voicemail/<message_id>/read?read=true" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### Delete Voicemail Message
+- **Endpoint**: `DELETE /api/v1/reports/voicemail/{message_id}`
+- Removes message metadata from database and purges recording audio file from disk.
+
+```bash
+curl -X DELETE "http://localhost:8000/api/v1/reports/voicemail/<message_id>" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+---
+
+## 9. System Prompts & Custom Audio Management
+
+### List Audio Files
+- **Endpoint**: `GET /api/v1/audio`
+- **Query Parameters**: `category` (`ivr_greeting`, `ivr_prompt`, `moh`), `tenant_id`
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/audio" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### Upload Custom Audio File
+- **Endpoint**: `POST /api/v1/audio/upload`
+- **Form Data**:
+  - `file`: Audio file (`.wav`, `.mp3`, `.ogg`)
+  - `category`: `ivr_greeting` | `ivr_prompt` | `moh`
+  - `tenant_id`: Optional tenant UUID
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/audio/upload" \
+  -H "Authorization: Bearer <access_token>" \
+  -F "file=@/path/to/custom_greeting.wav" \
+  -F "category=ivr_greeting"
+```
+
+### Stream Audio File
+- **Endpoint**: `GET /api/v1/audio/{file_id}/stream`
+- Streams audio for browser preview or FreeSWITCH playback.
+
+---
+
+## 10. Call Center Queues, Hunt Groups & Conferences
+
+### Call Queues (`mod_callcenter`)
+- **Endpoint**: `GET /api/v1/queues`, `POST /api/v1/queues`
+- Supported strategies: `round-robin`, `longest-idle-agent`, `top-down`, `ring-all`.
+- Supported tiers: Agent priority, penalty, and wrap-up times.
+
+### Hunt Groups / Ring Groups
+- **Endpoint**: `GET /api/v1/hunt-groups`, `POST /api/v1/hunt-groups`
+- Supported ring strategies: `simultaneous` (all ring at once), `sequential` (linear ordered failover), `random`.
+
+### Conference Rooms (`mod_conference`)
+- **Endpoint**: `GET /api/v1/conferences`, `POST /api/v1/conferences`
+- Pin protection for participants and moderators (`participant_pin`, `moderator_pin`), max members limits, and hold music assignment.
+
+---
+
+## 11. SMTP Settings & Email Notifications
+
+### Get SMTP Settings
+- **Endpoint**: `GET /api/v1/settings/smtp`
+- Returns configured status and active SMTP configuration. Automatically falls back to Global PBX SMTP settings if tenant settings are not defined.
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/settings/smtp" \
+  -H "Authorization: Bearer <access_token>"
+```
+
+### Update SMTP Configuration
+- **Endpoint**: `PUT /api/v1/settings/smtp`
+- **Request Body**:
+```json
+{
+  "smtp_host": "smtp.mailgun.org",
+  "smtp_port": 587,
+  "smtp_username": "postmaster@mycompany.com",
+  "smtp_password": "MySecretPassword!",
+  "from_email": "voicemail@mycompany.com",
+  "from_name": "PBX Notifications",
+  "use_tls": true
+}
+```
+
+### Test SMTP Connection
+- **Endpoint**: `POST /api/v1/settings/smtp/test`
+- Sends a live test email verifying host, credentials, TLS negotiation, and recipient delivery.
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/settings/smtp/test" \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"to_email": "admin@mycompany.com"}'
+```
+
+---
+
+## 12. Real-Time WebSockets Telemetry
+
+The platform provides live full-duplex WebSocket feeds for live dashboard metrics and instant report table updates.
+
+### Endpoints
+- **Reports Live Feed**: `ws://localhost:8000/ws/reports?token=<jwt_token>`
+- **Global Events Feed**: `ws://localhost:8000/ws/events?token=<jwt_token>`
+
+### Message Types
+1. `cdr.created`: Dispatched instantaneously when a call concludes and its CDR is processed.
+   ```json
+   {
+     "event": "cdr.created",
+     "type": "cdr.created",
+     "data": {
+       "caller_id_number": "1001",
+       "destination_number": "+15551234567",
+       "direction": "outbound",
+       "hangup_cause": "NORMAL_CLEARING",
+       "billsec": 42
+     }
+   }
+   ```
+2. `voicemail.created`: Dispatched when a caller records a voice message.
+   ```json
+   {
+     "event": "voicemail.created",
+     "type": "voicemail.created",
+     "data": {
+       "extension_number": "1001",
+       "caller_id_number": "+15559876543",
+       "duration": 25
+     }
+   }
+   ```
+3. `ping` / `pong`: Heartbeat keeping client sockets alive through proxies.

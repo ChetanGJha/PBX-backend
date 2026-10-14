@@ -1,8 +1,10 @@
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from src.core.websocket_manager import ws_manager
+from src.core.security import decode_token
 
 from src.core.config import settings
 from src.core.database import engine, execute_query_one
@@ -89,6 +91,39 @@ app.include_router(smtp.router, prefix=settings.API_V1_STR)
 
 # Include FreeSWITCH mod_xml_curl Router
 app.include_router(xml_curl_router.router)
+
+
+@app.websocket("/ws/reports")
+@app.websocket("/ws/events")
+async def websocket_reports_endpoint(websocket: WebSocket):
+    """
+    Real-time WebSocket endpoint for CDR events, reports telemetry, and live call metrics.
+    Accepts query param ?token=<jwt_token> for tenant scoping.
+    """
+    token = websocket.query_params.get("token")
+    user_tenant_id = None
+    is_admin = False
+
+    if token:
+        try:
+            payload = decode_token(token)
+            if payload:
+                user_tenant_id = payload.get("tenant_id")
+                is_admin = (payload.get("role") == "admin") or (user_tenant_id is None)
+        except Exception as e:
+            logger.warning(f"WebSocket token decode failure: {e}")
+
+    await ws_manager.connect(websocket, tenant_id=user_tenant_id, is_admin=is_admin)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.warning(f"WebSocket connection error: {e}")
+        ws_manager.disconnect(websocket)
 
 
 @app.get("/health", tags=["Monitoring"])

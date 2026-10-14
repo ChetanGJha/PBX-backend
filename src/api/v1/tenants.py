@@ -15,6 +15,7 @@ class TenantCreate(BaseModel):
     timezone: Optional[str] = "UTC"
     max_extensions: Optional[int] = 100
     max_concurrent_calls: Optional[int] = 20
+    allow_internal_calls: Optional[bool] = True
 
 
 class TenantUpdate(BaseModel):
@@ -26,6 +27,7 @@ class TenantUpdate(BaseModel):
     enabled: Optional[bool] = None
     max_extensions: Optional[int] = None
     max_concurrent_calls: Optional[int] = None
+    allow_internal_calls: Optional[bool] = None
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -55,10 +57,10 @@ async def create_tenant(
 
     import json
     query = """
-        INSERT INTO tenants (name, domain, sip_domain, branding, timezone, max_extensions, max_concurrent_calls)
-        VALUES (:name, :domain, :sip_domain, CAST(:branding AS jsonb), :timezone, :max_extensions, :max_concurrent_calls)
+        INSERT INTO tenants (name, domain, sip_domain, branding, timezone, max_extensions, max_concurrent_calls, allow_internal_calls)
+        VALUES (:name, :domain, :sip_domain, CAST(:branding AS jsonb), :timezone, :max_extensions, :max_concurrent_calls, :allow_internal_calls)
 
-        RETURNING id, name, domain, sip_domain, timezone, enabled, max_extensions, max_concurrent_calls, created_at
+        RETURNING id, name, domain, sip_domain, timezone, enabled, allow_internal_calls, max_extensions, max_concurrent_calls, created_at
     """
     row = await execute_query_one(query, {
         "name": payload.name,
@@ -67,7 +69,8 @@ async def create_tenant(
         "branding": json.dumps(payload.branding or {}),
         "timezone": payload.timezone or "UTC",
         "max_extensions": payload.max_extensions or 100,
-        "max_concurrent_calls": payload.max_concurrent_calls or 20
+        "max_concurrent_calls": payload.max_concurrent_calls or 20,
+        "allow_internal_calls": payload.allow_internal_calls if payload.allow_internal_calls is not None else True
     })
 
     return dict(row)
@@ -84,7 +87,7 @@ async def list_tenants(
     """
     if current_user.is_super_admin:
         query = """
-            SELECT id, name, domain, sip_domain, timezone, enabled, max_extensions, 
+            SELECT id, name, domain, sip_domain, timezone, enabled, allow_internal_calls, max_extensions, 
                    max_concurrent_calls, created_at
             FROM tenants
             WHERE deleted_at IS NULL
@@ -96,7 +99,7 @@ async def list_tenants(
         if not current_user.tenant_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No tenant context found")
         query = """
-            SELECT id, name, domain, sip_domain, timezone, enabled, max_extensions, 
+            SELECT id, name, domain, sip_domain, timezone, enabled, allow_internal_calls, max_extensions, 
                    max_concurrent_calls, created_at
             FROM tenants
             WHERE id = CAST(:tenant_id AS uuid) AND deleted_at IS NULL
@@ -117,7 +120,7 @@ async def get_tenant(
     validate_tenant_access(current_user, tenant_id)
 
     query = """
-        SELECT id, name, domain, sip_domain, branding, timezone, enabled, 
+        SELECT id, name, domain, sip_domain, branding, timezone, enabled, allow_internal_calls,
                max_extensions, max_concurrent_calls, created_at, updated_at
         FROM tenants
         WHERE id = CAST(:tenant_id AS uuid) AND deleted_at IS NULL
@@ -157,9 +160,10 @@ async def update_tenant(
             enabled = COALESCE(:enabled, enabled),
             max_extensions = COALESCE(:max_extensions, max_extensions),
             max_concurrent_calls = COALESCE(:max_concurrent_calls, max_concurrent_calls),
+            allow_internal_calls = COALESCE(:allow_internal_calls, allow_internal_calls),
             updated_at = NOW()
         WHERE id = CAST(:tenant_id AS uuid) AND deleted_at IS NULL
-        RETURNING id, name, domain, sip_domain, branding, timezone, enabled, max_extensions, max_concurrent_calls, updated_at
+        RETURNING id, name, domain, sip_domain, branding, timezone, enabled, allow_internal_calls, max_extensions, max_concurrent_calls, updated_at
     """
     row = await execute_query_one(query, {
         "tenant_id": tenant_id,
@@ -170,7 +174,8 @@ async def update_tenant(
         "timezone": payload.timezone,
         "enabled": payload.enabled,
         "max_extensions": payload.max_extensions,
-        "max_concurrent_calls": payload.max_concurrent_calls
+        "max_concurrent_calls": payload.max_concurrent_calls,
+        "allow_internal_calls": payload.allow_internal_calls
     })
 
     if not row:

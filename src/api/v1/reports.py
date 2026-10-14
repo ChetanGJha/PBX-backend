@@ -1,4 +1,6 @@
 import os
+import re
+import asyncio
 import logging
 from typing import Optional, List
 from uuid import UUID
@@ -17,7 +19,9 @@ async def get_cdr_report(
     tenant_id: Optional[UUID] = None,
     start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
     end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
-    call_type: Optional[str] = "all",  # all, internal, inbound, outbound
+    call_type: Optional[str] = "all",  # backward-compatibility
+    direction: Optional[str] = Query(None, description="all, internal, inbound, outbound"),
+    disposition: Optional[str] = Query(None, description="all, ANSWERED, NO_ANSWER, BUSY, FAILED"),
     current_user: CurrentUser = Depends(get_current_user)
 ):
     """
@@ -65,13 +69,117 @@ async def get_cdr_report(
         query += " AND c.start_time <= CAST(:end_date AS timestamptz)"
         params["end_date"] = f"{end_date} 23:59:59"
 
-    if call_type and call_type != "all":
-        query += " AND c.direction = :call_type"
-        params["call_type"] = call_type
+    active_dir = direction if direction is not None else call_type
+    if active_dir and active_dir != "all":
+        query += " AND c.direction = :active_dir"
+        params["active_dir"] = active_dir
+
+    if disposition and disposition != "all":
+        disp_upper = disposition.upper()
+        if disp_upper == "ANSWERED":
+            query += " AND (c.billsec > 0 OR c.hangup_cause = 'NORMAL_CLEARING')"
+        elif disp_upper == "NO_ANSWER":
+            query += " AND (c.billsec = 0 AND c.hangup_cause IN ('NO_ANSWER', 'ORIGINATOR_CANCEL', 'NORMAL_TEMPORARY_FAILURE', 'NO_USER_RESPONSE'))"
+        elif disp_upper == "BUSY":
+            query += " AND (c.billsec = 0 AND c.hangup_cause IN ('USER_BUSY', 'CALL_REJECTED'))"
+        elif disp_upper == "FAILED":
+            query += " AND (c.billsec = 0 AND (c.hangup_cause IS NULL OR c.hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'ORIGINATOR_CANCEL', 'NORMAL_TEMPORARY_FAILURE', 'NO_USER_RESPONSE', 'USER_BUSY', 'CALL_REJECTED')))"
 
     query += " ORDER BY c.start_time DESC LIMIT 500"
     rows = await execute_query(query, params)
     return [dict(r) for r in rows]
+
+
+@router.get("/disposition-summary")
+async def get_disposition_summary_report(
+    tenant_id: Optional[UUID] = None,
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    direction: Optional[str] = Query("all", description="all, inbound, outbound, internal"),
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Fetch disposition summary KPIs and breakdown table (Answered, Busy, No Answer, Failed).
+    """
+    target_tenant = tenant_id if current_user.is_super_admin and tenant_id else current_user.tenant_id
+
+    query = """
+        SELECT 
+            COUNT(*) as total_calls,
+            COUNT(*) FILTER (WHERE billsec > 0 OR hangup_cause = 'NORMAL_CLEARING') as answered_calls,
+            COUNT(*) FILTER (WHERE billsec = 0 AND hangup_cause IN ('NO_ANSWER', 'ORIGINATOR_CANCEL', 'NORMAL_TEMPORARY_FAILURE', 'NO_USER_RESPONSE')) as no_answer_calls,
+            COUNT(*) FILTER (WHERE billsec = 0 AND hangup_cause IN ('USER_BUSY', 'CALL_REJECTED')) as busy_calls,
+            COUNT(*) FILTER (WHERE billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'ORIGINATOR_CANCEL', 'NORMAL_TEMPORARY_FAILURE', 'NO_USER_RESPONSE', 'USER_BUSY', 'CALL_REJECTED'))) as failed_calls,
+            COALESCE(AVG(duration), 0) as avg_duration,
+            COALESCE(AVG(billsec) FILTER (WHERE billsec > 0), 0) as avg_billsec
+        FROM cdr
+        WHERE 1=1
+    """
+    params = {}
+    if target_tenant:
+        query += " AND tenant_id = CAST(:t_id AS uuid)"
+        params["t_id"] = str(target_tenant)
+    if start_date:
+        query += " AND start_time >= CAST(:start_date AS timestamptz)"
+        params["start_date"] = f"{start_date} 00:00:00"
+    if end_date:
+        query += " AND start_time <= CAST(:end_date AS timestamptz)"
+        params["end_date"] = f"{end_date} 23:59:59"
+    if direction and direction != "all":
+        query += " AND direction = :dir"
+        params["dir"] = direction
+
+    row = await execute_query_one(query, params)
+    total = row["total_calls"] if row else 0
+    answered = row["answered_calls"] if row else 0
+    no_answer = row["no_answer_calls"] if row else 0
+    busy = row["busy_calls"] if row else 0
+    failed = row["failed_calls"] if row else 0
+
+    answer_rate = round((answered / total * 100), 1) if total > 0 else 0.0
+
+    breakdown_query = """
+        SELECT 
+            COALESCE(hangup_cause, 'UNKNOWN') as cause,
+            COUNT(*) as count,
+            ROUND(COALESCE(AVG(duration), 0)::numeric, 1) as avg_duration,
+            ROUND(COALESCE(AVG(billsec), 0)::numeric, 1) as avg_billsec
+        FROM cdr
+        WHERE 1=1
+    """
+    if target_tenant:
+        breakdown_query += " AND tenant_id = CAST(:t_id AS uuid)"
+    if start_date:
+        breakdown_query += " AND start_time >= CAST(:start_date AS timestamptz)"
+    if end_date:
+        breakdown_query += " AND start_time <= CAST(:end_date AS timestamptz)"
+    if direction and direction != "all":
+        breakdown_query += " AND direction = :dir"
+
+    breakdown_query += " GROUP BY hangup_cause ORDER BY count DESC"
+    breakdown_rows = await execute_query(breakdown_query, params)
+
+    breakdown = []
+    for r in breakdown_rows:
+        cnt = r["count"]
+        pct = round((cnt / total * 100), 1) if total > 0 else 0.0
+        breakdown.append({
+            "cause": r["cause"],
+            "count": cnt,
+            "percentage": pct,
+            "avg_duration": float(r["avg_duration"] or 0),
+            "avg_billsec": float(r["avg_billsec"] or 0)
+        })
+
+    return {
+        "total_calls": total,
+        "answered": answered,
+        "no_answer": no_answer,
+        "busy": busy,
+        "failed": failed,
+        "answer_rate": answer_rate,
+        "breakdown": breakdown
+    }
 
 
 @router.get("/recordings")
@@ -522,7 +630,7 @@ async def get_dashboard_metrics(
     Get profile-specific dashboard metrics including System Utilization, Live Calls,
     counts, Traffic Summary (inbound/outbound answered/unanswered/failed), and Traffic Peak.
     """
-    target_tenant = tenant_id if current_user.is_super_admin and tenant_id else current_user.tenant_id
+    target_tenant = tenant_id if current_user.is_super_admin else current_user.tenant_id
 
     sys_util = get_system_utilization()
 
@@ -569,26 +677,37 @@ async def get_dashboard_metrics(
     ivr_count = ivr_row["cnt"] if ivr_row else 0
 
     # 2. Live Calls
-    live_query = "SELECT COUNT(*) as cnt FROM cdr WHERE answer_time IS NOT NULL AND end_time IS NULL"
-    live_params = {}
-    if target_tenant:
-        live_query += " AND tenant_id = CAST(:t_id AS uuid)"
-        live_params["t_id"] = str(target_tenant)
-    live_row = await execute_query_one(live_query, live_params)
-    live_calls = live_row["cnt"] if live_row else 0
+    # Query live active channels via FreeSWITCH ESL, with graceful fallback
+    live_calls = 0
+    try:
+        from src.services.gateway_sync import execute_esl_command
+
+        def _get_esl_channels():
+            output = execute_esl_command("show channels count")
+            if output:
+                m = re.search(r"(\d+)\s+total", output)
+                if m:
+                    return int(m.group(1))
+            return None
+
+        esl_count = await asyncio.to_thread(_get_esl_channels)
+        if esl_count is not None:
+            live_calls = esl_count
+    except Exception as e:
+        logger.debug(f"ESL channel count fallback: {e}")
 
     # 3. Traffic Summary
     traffic_query = """
         SELECT 
             COUNT(*) FILTER (WHERE direction = 'inbound') as in_total,
-            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec > 0) as in_answered,
-            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND hangup_cause IN ('NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE')) as in_unanswered,
-            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE'))) as in_failed,
+            COUNT(*) FILTER (WHERE direction = 'inbound' AND (billsec > 0 OR hangup_cause = 'NORMAL_CLEARING')) as in_answered,
+            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND hangup_cause IN ('NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE', 'NORMAL_TEMPORARY_FAILURE')) as in_unanswered,
+            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE', 'NORMAL_TEMPORARY_FAILURE'))) as in_failed,
 
-            COUNT(*) FILTER (WHERE direction = 'outbound' OR LENGTH(destination) > 6) as out_total,
-            COUNT(*) FILTER (WHERE (direction = 'outbound' OR LENGTH(destination) > 6) AND billsec > 0) as out_answered,
-            COUNT(*) FILTER (WHERE (direction = 'outbound' OR LENGTH(destination) > 6) AND billsec = 0 AND hangup_cause IN ('NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE')) as out_unanswered,
-            COUNT(*) FILTER (WHERE (direction = 'outbound' OR LENGTH(destination) > 6) AND billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE'))) as out_failed
+            COUNT(*) FILTER (WHERE direction = 'outbound' OR (direction != 'internal' AND direction != 'inbound' AND LENGTH(destination) > 6)) as out_total,
+            COUNT(*) FILTER (WHERE (direction = 'outbound' OR (direction != 'internal' AND direction != 'inbound' AND LENGTH(destination) > 6)) AND (billsec > 0 OR hangup_cause = 'NORMAL_CLEARING')) as out_answered,
+            COUNT(*) FILTER (WHERE (direction = 'outbound' OR (direction != 'internal' AND direction != 'inbound' AND LENGTH(destination) > 6)) AND billsec = 0 AND hangup_cause IN ('NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE', 'NORMAL_TEMPORARY_FAILURE')) as out_unanswered,
+            COUNT(*) FILTER (WHERE (direction = 'outbound' OR (direction != 'internal' AND direction != 'inbound' AND LENGTH(destination) > 6)) AND billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE', 'NORMAL_TEMPORARY_FAILURE'))) as out_failed
         FROM cdr
         WHERE 1=1
     """
