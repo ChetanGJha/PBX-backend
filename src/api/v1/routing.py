@@ -184,3 +184,36 @@ async def delete_route(
     )
     return None
 
+
+@router.get("/internal-policy")
+async def get_internal_routing_policy(
+    tenant_id: Optional[UUID] = None,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    target_tenant = tenant_id if current_user.is_super_admin and tenant_id else current_user.tenant_id
+    if not target_tenant:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    row = await execute_query_one(
+        "SELECT allow_internal_calls FROM tenants WHERE id = CAST(:t_id AS uuid) AND deleted_at IS NULL",
+        {"t_id": str(target_tenant)}
+    )
+    allow = row["allow_internal_calls"] if row and row.get("allow_internal_calls") is not None else True
+    return {"allow_internal_calls": allow}
+
+
+@router.post("/internal-policy")
+async def update_internal_routing_policy(
+    payload: dict,
+    tenant_id: Optional[UUID] = None,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    target_tenant = tenant_id if current_user.is_super_admin and tenant_id else current_user.tenant_id
+    if not target_tenant:
+        raise HTTPException(status_code=400, detail="Tenant context required")
+    allow_internal = bool(payload.get("allow_internal_calls", True))
+    await execute_query(
+        "UPDATE tenants SET allow_internal_calls = :allow, updated_at = NOW() WHERE id = CAST(:t_id AS uuid)",
+        {"allow": allow_internal, "t_id": str(target_tenant)}
+    )
+    return {"status": "success", "allow_internal_calls": allow_internal}
+

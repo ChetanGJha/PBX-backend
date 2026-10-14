@@ -23,35 +23,8 @@ VOICEMAIL_CONTINUE_ON_FAIL = (
 )
 
 
-def check_registered_domain(ext_num: str, candidate_domains: List[str]) -> Optional[str]:
-    """
-    Directly queries FreeSWITCH mod_event_socket to find where an extension is actively registered.
-    Returns the exact registered domain (e.g. '127.0.0.1' or 'pbx.aikyamlabs.local') or None if offline.
-    """
-    try:
-        s = socket.socket()
-        s.settimeout(1.0)
-        s.connect(('freeswitch', 8021))
-        s.recv(1024)
-        s.sendall(b'auth ClueCon\n\n')
-        s.recv(1024)
-        for dom in candidate_domains:
-            s.sendall(f'api sofia_contact */{ext_num}@{dom}\n\n'.encode())
-            data = ""
-            while True:
-                chunk = s.recv(1024).decode('utf-8', errors='ignore')
-                if not chunk:
-                    break
-                data += chunk
-                if "error/user_not_registered" in data or "sofia/internal" in data:
-                    break
-            if "error/user_not_registered" not in data and "sofia/internal" in data:
-                s.close()
-                return dom
-        s.close()
-    except Exception as e:
-        logger.warning(f"Error checking sofia registration for {ext_num}: {e}")
-    return None
+# Native FreeSWITCH Sofia handles user registration lookups directly via user/${ext_num}@${domain}
+# No brittle socket pre-checks needed.
 
 
 async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
@@ -349,7 +322,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             "tenant_id": tenant_id
         }
 
-    if hunt_group:
+    if hunt_group and isinstance(hunt_group, dict) and hunt_group.get("name"):
         hg_name = hunt_group["name"]
         hg_timeout = hunt_group.get("timeout") or 25
         raw_members = hunt_group.get("members") or ""
@@ -382,11 +355,7 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
         SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
 
-        candidate_domains = list(dict.fromkeys(["127.0.0.1", domain_name, "pbx.aikyamlabs.local"]))
-        bridge_endpoints = []
-        for m_ext in member_list:
-            active_dom = check_registered_domain(m_ext, candidate_domains) or domain_name
-            bridge_endpoints.append(f"user/{m_ext}@{active_dom}")
+        bridge_endpoints = [f"user/{m_ext}@{domain_name}" for m_ext in member_list]
 
         if bridge_endpoints:
             # Simultaneous bridge strategy rings all member endpoints together
@@ -485,6 +454,20 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         ext_num = target_ext["extension_number"]
         callee_domain = target_ext.get("sip_domain") or domain_name
 
+        # Check tenant policy for internal calling
+        tenant_row = await execute_query_one(
+            "SELECT allow_internal_calls FROM tenants WHERE id = CAST(:tid AS uuid)",
+            {"tid": tenant_id}
+        )
+        allow_internal = tenant_row.get("allow_internal_calls") if tenant_row else True
+        if allow_internal is False:
+            logger.info(f"Internal extension calling disabled for tenant {tenant_id}. Rejecting call to {ext_num}")
+            ext_elem = SubElement(context_elem, "extension", name=f"reject_internal_{ext_num}")
+            cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=f"^{ext_num}$")
+            SubElement(cond_elem, "action", application="respond", data="403 Forbidden - Internal Calling Disabled")
+            SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
+            return format_xml(doc)
+
         # Check Call Forwarding
         cf_record = await execute_query_one(
             """
@@ -557,18 +540,10 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             logger.info(f"Extension {ext_num} has unconditional forward to {cf_dest}")
             SubElement(cond_elem, "action", application="transfer", data=f"{cf_dest} XML {context}")
         else:
-            # Query FreeSWITCH to check if and where the callee extension is actively registered
-            candidate_domains = list(dict.fromkeys(["127.0.0.1", callee_domain, "pbx.aikyamlabs.local"]))
-            active_domain = check_registered_domain(ext_num, candidate_domains)
-
-            if active_domain:
-                logger.info(f"Callee {ext_num} is actively registered on {active_domain}. Bridging with timeout={timeout}s...")
-                bridge_opts = f"{{ignore_early_media=true,originate_timeout={timeout},call_timeout={timeout},leg_timeout={timeout}}}"
-                SubElement(cond_elem, "action", application="bridge", data=f"{bridge_opts}user/{ext_num}@{active_domain}")
-                SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
-            else:
-                logger.info(f"Callee {ext_num} is offline (unregistered). Routing to failover target: {fail_target}.")
-                SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
+            logger.info(f"Bridging internal call to user/{ext_num}@{callee_domain} with timeout={timeout}s...")
+            bridge_opts = f"{{ignore_early_media=true,originate_timeout={timeout},call_timeout={timeout},leg_timeout={timeout},continue_on_fail=true}}"
+            SubElement(cond_elem, "action", application="bridge", data=f"{bridge_opts}user/{ext_num}@{callee_domain}")
+            SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
 
         # Declare the forward-on-no-answer extension in context if enabled
         if has_fwd_no_answer:
