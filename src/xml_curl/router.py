@@ -124,7 +124,14 @@ async def handle_xml_curl(request: Request):
             xml_response = await handle_dialplan_request(form_dict)
             return Response(content=xml_response, media_type="text/xml")
         elif section == "configuration":
-            if key_value == "json_cdr.conf":
+            if key_value == "callcenter.conf":
+                from src.xml_curl.configuration import generate_callcenter_conf_xml
+                xml_content = await generate_callcenter_conf_xml()
+                return Response(content=xml_content, media_type="text/xml")
+            elif key_value == "conference.conf":
+                from src.xml_curl.configuration import generate_conference_conf_xml
+                return Response(content=generate_conference_conf_xml(), media_type="text/xml")
+            elif key_value == "json_cdr.conf":
                 return Response(content=JSON_CDR_CONF_XML, media_type="text/xml")
             elif key_value in ("xml_cdr.conf", "mod_xml_cdr.conf"):
                 return Response(content=XML_CDR_CONF_XML, media_type="text/xml")

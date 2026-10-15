@@ -2,6 +2,7 @@
   <bindings>
     <binding name="directory">
       <param name="gateway-url" value="http://api:8000/freeswitch/xml" method="POST"/>
+      <param name="bindings" value="directory"/>
       <param name="timeout" value="10"/>
       <param name="enable-post-load" value="true"/>
       <param name="bind-params" value="both"/>
@@ -9,6 +10,7 @@
     
     <binding name="dialplan">
       <param name="gateway-url" value="http://api:8000/freeswitch/xml" method="POST"/>
+      <param name="bindings" value="dialplan"/>
       <param name="timeout" value="10"/>
       <param name="enable-post-load" value="true"/>
       <param name="bind-params" value="both"/>
@@ -16,6 +18,7 @@
     
     <binding name="configuration">
       <param name="gateway-url" value="http://api:8000/freeswitch/xml" method="POST"/>
+      <param name="bindings" value="configuration"/>
       <param name="timeout" value="10"/>
       <param name="enable-post-load" value="true"/>
       <param name="bind-params" value="both"/>

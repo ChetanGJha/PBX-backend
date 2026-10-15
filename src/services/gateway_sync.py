@@ -103,43 +103,51 @@ def render_gateway_xml(gw: Dict[str, Any]) -> str:
 def execute_esl_command(command: str) -> Optional[str]:
     """
     Executes a command on FreeSWITCH via Event Socket (ESL).
+    Tries configured host followed by container and host loopback candidates.
     """
-    host = settings.FREESWITCH_ESL_HOST
     port = settings.FREESWITCH_ESL_PORT
     password = settings.FREESWITCH_ESL_PASSWORD
+    hosts_to_try = [settings.FREESWITCH_ESL_HOST]
+    for h in ["freeswitch", "127.0.0.1", "localhost", "pbx_freeswitch"]:
+        if h and h not in hosts_to_try:
+            hosts_to_try.append(h)
 
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3.0)
-        s.connect((host, port))
-        
-        # Read banner
-        s.recv(1024)
-        
-        # Authenticate
-        s.sendall(f"auth {password}\n\n".encode())
-        auth_resp = s.recv(1024).decode(errors="ignore")
-        if "+OK accepted" not in auth_resp:
-            logger.error(f"FreeSWITCH ESL authentication failed on {host}:{port}")
+    for host in hosts_to_try:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            s.connect((host, port))
+            
+            # Read banner
+            s.recv(1024)
+            
+            # Authenticate
+            s.sendall(f"auth {password}\n\n".encode())
+            auth_resp = s.recv(1024).decode(errors="ignore")
+            if "+OK accepted" not in auth_resp:
+                logger.error(f"FreeSWITCH ESL authentication failed on {host}:{port}")
+                s.close()
+                continue
+
+            # Execute API command
+            s.sendall(f"api {command}\n\n".encode())
+            data = ""
+            while True:
+                chunk = s.recv(4096).decode(errors="ignore")
+                if not chunk:
+                    break
+                data += chunk
+                if len(chunk) < 4096:
+                    break
+
             s.close()
-            return None
+            logger.info(f"FreeSWITCH ESL command '{command}' succeeded on {host}:{port}")
+            return data
+        except Exception:
+            continue
 
-        # Execute API command
-        s.sendall(f"api {command}\n\n".encode())
-        data = ""
-        while True:
-            chunk = s.recv(4096).decode(errors="ignore")
-            if not chunk:
-                break
-            data += chunk
-            if len(chunk) < 4096:
-                break
-
-        s.close()
-        return data
-    except Exception as e:
-        logger.warning(f"Failed to execute ESL command '{command}' on {host}:{port}: {e}")
-        return None
+    logger.warning(f"Failed to execute ESL command '{command}' across hosts {hosts_to_try}:{port}")
+    return None
 
 
 async def sync_gateways_to_freeswitch() -> Dict[str, Any]:

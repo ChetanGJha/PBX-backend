@@ -1,5 +1,6 @@
 <profile name="internal">
   <aliases>
+    <alias name="pbx.terrixai.com"/>
     <alias name="pbx.aikyamlabs.local"/>
     <alias name="127.0.0.1"/>
     <alias name="8.234.117.15"/>
@@ -24,7 +25,8 @@
     <param name="inbound-codec-negotiation" value="generous"/>
 
     <!-- Dynamic HTTP Directory lookup via mod_xml_curl -->
-    <param name="auth-calls" value="true"/>
+    <param name="auth-calls" value="false"/>
+    <param name="auth-registrations" value="true"/>
     <param name="accept-blind-reg" value="false"/>
     <param name="accept-blind-auth" value="false"/>
     <param name="suppress-cng" value="true"/>

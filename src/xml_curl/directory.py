@@ -40,14 +40,14 @@ async def handle_directory_request(form_data: Dict[str, Any]) -> str:
 
     # 1. Lookup Tenant by sip_domain or domain
     tenant = await execute_query_one(
-        "SELECT id, name, domain, sip_domain FROM tenants WHERE (sip_domain = :d OR domain = :d) AND enabled = true AND deleted_at IS NULL",
+        "SELECT id, name, domain, sip_domain FROM tenants WHERE (sip_domain = :d OR domain = :d) AND enabled = true AND deleted_at IS NULL LIMIT 1",
         {"d": domain_name}
     )
 
-    # Fallback to primary production tenant (pbx.aikyamlabs.local) for IP or localhost registrations
+    # Fallback to active tenant if registered via PBX host/IP or localhost
     if not tenant:
         tenant = await execute_query_one(
-            "SELECT id, name, domain, sip_domain FROM tenants WHERE (sip_domain = 'pbx.aikyamlabs.local' OR domain = 'pbx.aikyamlabs.local') AND enabled = true AND deleted_at IS NULL"
+            "SELECT id, name, domain, sip_domain FROM tenants WHERE enabled = true AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1"
         )
 
     # Fallback to first active tenant if still not found
@@ -100,10 +100,9 @@ async def handle_directory_request(form_data: Dict[str, Any]) -> str:
     doc = Element("document", type="freeswitch/xml")
     section = SubElement(doc, "section", name="directory")
 
-    # Support both the queried domain (which may be an IP or FQDN) and the tenant's canonical sip_domain
-    domains_to_create = [domain_name]
-    if sip_domain and sip_domain != domain_name:
-        domains_to_create.append(sip_domain)
+    # Support queried domain, tenant sip_domain, and PBX server host aliases
+    aliases = [domain_name, sip_domain, "pbx.terrixai.com", "8.234.117.15", "127.0.0.1"]
+    domains_to_create = list(dict.fromkeys([a for a in aliases if a]))
 
     # Standard Sofia dial-string allows FreeSWITCH to locate the live Sofia registration contact
     sofia_dial_string = "{presence_id=${dialed_user}@${dialed_domain}}${sofia_contact(${dialed_user}@${dialed_domain})}"
