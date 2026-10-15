@@ -141,5 +141,70 @@ class TestDialplanRoutingEnhancements(unittest.IsolatedAsyncioTestCase):
             self.assertIn("user/1003@pbx.terrixai.com", xml_res)
             self.assertIn("|", xml_res)
 
+    async def test_outbound_call_from_extension_in_public_context(self):
+        """Registered extension dialing outbound PSTN from context 'public' is authorized and bridged to gateway."""
+        form_data = {
+            "Caller-Context": "public",
+            "Caller-Destination-Number": "+919702243283",
+            "Caller-Caller-ID-Number": "1001",
+            "variable_sip_from_user": "1001",
+            "domain": "terrixpbx.terrixai.com"
+        }
+        mock_ext = {
+            "id": "ext-1001",
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+            "extension_number": "1001",
+            "outbound_caller_id": "+919702243283",
+            "caller_id_name": "Test User",
+            "caller_id_number": "1001"
+        }
+        mock_gw = {
+            "id": "gw-1",
+            "gateway_name": "ISHAN_ITS",
+            "proxy": "103.132.242.42",
+            "profile": "external"
+        }
+
+        async def mock_db(query, params=None):
+            q = query.lower()
+            p = params or {}
+            if "from extensions" in q:
+                if p.get("ext") == "1001":
+                    return mock_ext
+                return None
+            if "inbound_did" in q or "from dids" in q:
+                return None
+            if ("from call_routes" in q and "outbound" in q) or "from gateways" in q:
+                return mock_gw
+            return None
+
+        with patch("src.xml_curl.dialplan.execute_query_one", side_effect=mock_db):
+            xml_res = await handle_dialplan_request(form_data)
+            self.assertIn('application="bridge"', xml_res)
+            self.assertIn("sofia/gateway/ISHAN_ITS/+919702243283", xml_res)
+            self.assertIn("sofia/gateway/ISHAN_ITS/919702243283", xml_res)
+            self.assertIn("effective_caller_id_number=+919702243283", xml_res)
+            self.assertNotIn("reject_public_outbound", xml_res)
+
+    async def test_outbound_call_rejected_for_unauthorized_caller_in_public_context(self):
+        """Unauthorized external caller dialing outbound PSTN from context 'public' is rejected with 403."""
+        form_data = {
+            "Caller-Context": "public",
+            "Caller-Destination-Number": "+919702243283",
+            "Caller-Caller-ID-Number": "unknown_scanner",
+            "variable_sip_from_user": "unknown_scanner",
+            "domain": "terrixpbx.terrixai.com"
+        }
+
+        async def mock_db(query, params=None):
+            # Unknown caller is not an extension in the database
+            return None
+
+        with patch("src.xml_curl.dialplan.execute_query_one", side_effect=mock_db):
+            xml_res = await handle_dialplan_request(form_data)
+            self.assertIn("reject_public_outbound", xml_res)
+            self.assertIn("403 Forbidden - Outbound Not Allowed", xml_res)
+            self.assertIn("CALL_REJECTED", xml_res)
+
 if __name__ == "__main__":
     unittest.main()
