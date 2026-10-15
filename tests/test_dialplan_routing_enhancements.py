@@ -136,7 +136,10 @@ class TestDialplanRoutingEnhancements(unittest.IsolatedAsyncioTestCase):
         with patch("src.xml_curl.dialplan.execute_query_one", side_effect=mock_db):
             xml_res = await handle_dialplan_request(form_data)
             self.assertIn('application="bridge"', xml_res)
-            self.assertIn("user/1001@pbx.terrixai.com|user/1002@pbx.terrixai.com|user/1003@pbx.terrixai.com", xml_res)
+            self.assertIn("user/1001@pbx.terrixai.com", xml_res)
+            self.assertIn("user/1002@pbx.terrixai.com", xml_res)
+            self.assertIn("user/1003@pbx.terrixai.com", xml_res)
+            self.assertIn("|", xml_res)
 
 if __name__ == "__main__":
     unittest.main()

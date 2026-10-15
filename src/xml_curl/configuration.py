@@ -100,7 +100,7 @@ async def generate_callcenter_conf_xml() -> str:
         for agent_num in agent_list:
             if agent_num not in registered_agents:
                 registered_agents.add(agent_num)
-                # Contact attempts user/{agent_num} and user/{agent_num}@{sip_domain}
+                # Contact attempts agent on sip_domain and local user
                 contact_str = f"[leg_timeout={q_timeout}]user/{agent_num}@{sip_domain},user/{agent_num}"
                 SubElement(
                     agents_elem,

@@ -66,6 +66,24 @@ async def list_queues(
     return [dict(r) for r in rows]
 
 
+import asyncio
+import logging
+
+logger = logging.getLogger("pbx.api.queues")
+
+
+def reload_freeswitch_queues(queue_number: Optional[str] = None):
+    """Refreshes FreeSWITCH XML and mod_callcenter queues via ESL."""
+    try:
+        execute_esl_command("reloadxml")
+        execute_esl_command("reload mod_callcenter")
+        if queue_number:
+            execute_esl_command(f"callcenter_config queue load {queue_number}")
+            execute_esl_command(f"callcenter_config queue reload {queue_number}")
+    except Exception as e:
+        logger.warning(f"Could not reload FreeSWITCH queues via ESL: {e}")
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_queue(
     payload: QueueCreate,
@@ -84,11 +102,8 @@ async def create_queue(
     data = payload.dict()
     data["tenant_id"] = target_tenant
     row = await execute_query_one(query, data)
-    try:
-        execute_esl_command("reloadxml")
-        execute_esl_command("reload mod_callcenter")
-    except Exception:
-        pass
+    q_num = str(row.get("queue_number")) if row else None
+    await asyncio.to_thread(reload_freeswitch_queues, q_num)
     return dict(row)
 
 
@@ -126,11 +141,8 @@ async def update_queue(
         RETURNING id, name, queue_number, strategy, agent_timeout, wrap_up_time, max_wait_time, agents, enabled, created_at::text, tenant_id::text as tenant_id
     """
     row = await execute_query_one(query, params)
-    try:
-        execute_esl_command("reloadxml")
-        execute_esl_command("reload mod_callcenter")
-    except Exception:
-        pass
+    q_num = str(row.get("queue_number")) if row else None
+    await asyncio.to_thread(reload_freeswitch_queues, q_num)
     return dict(row)
 
 
@@ -142,7 +154,7 @@ async def delete_queue(
     """
     Soft-delete a call queue.
     """
-    check_query = "SELECT id, tenant_id FROM queues WHERE id = CAST(:id AS uuid) AND deleted_at IS NULL"
+    check_query = "SELECT id, queue_number, tenant_id FROM queues WHERE id = CAST(:id AS uuid) AND deleted_at IS NULL"
     existing = await execute_query_one(check_query, {"id": str(queue_id)})
     if not existing:
         raise HTTPException(status_code=404, detail="Queue not found")
@@ -154,9 +166,6 @@ async def delete_queue(
         "UPDATE queues SET deleted_at = NOW() WHERE id = CAST(:id AS uuid) RETURNING id",
         {"id": str(queue_id)}
     )
-    try:
-        execute_esl_command("reloadxml")
-        execute_esl_command("reload mod_callcenter")
-    except Exception:
-        pass
+    q_num = str(existing.get("queue_number")) if existing else None
+    await asyncio.to_thread(reload_freeswitch_queues, q_num)
     return None

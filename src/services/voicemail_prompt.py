@@ -18,6 +18,7 @@ def ensure_voicemail_prompt(ext_num: str) -> str:
     """
     try:
         os.makedirs(PROMPTS_DIR, exist_ok=True)
+        os.makedirs("/var/lib/freeswitch/recordings/voicemail", exist_ok=True)
     except OSError:
         pass
     target_wav = os.path.join(PROMPTS_DIR, f"voicemail_{ext_num}.wav")

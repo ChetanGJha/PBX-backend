@@ -24,8 +24,7 @@ VOICEMAIL_CONTINUE_ON_FAIL = (
 )
 
 
-# Native FreeSWITCH Sofia handles user registration lookups directly via user/${ext_num}@${domain}
-# No brittle socket pre-checks needed.
+
 
 
 async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
@@ -68,7 +67,12 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
 
     if not tenant_id and domain_name:
         t_row = await execute_query_one(
-            "SELECT id FROM tenants WHERE (sip_domain = :d OR domain = :d) AND enabled = true AND deleted_at IS NULL",
+            """
+            SELECT id FROM tenants 
+            WHERE (sip_domain = :d OR domain = :d OR :d LIKE '%' || domain OR domain LIKE '%' || :d) 
+              AND enabled = true AND deleted_at IS NULL
+            LIMIT 1
+            """,
             {"d": domain_name}
         )
         if t_row:
@@ -543,11 +547,8 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
         SubElement(cond_elem, "action", application="set", data="instant_ringback=true")
 
-        candidate_domains = list(dict.fromkeys([domain_name, "pbx.terrixai.com", "8.234.117.15", "pbx.aikyamlabs.local"]))
-
         if dest_type == "extension":
-            bridge_endpoints = [f"user/{target}@{d}" for d in candidate_domains if d] + [f"user/{target}"]
-            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]" + ",".join(bridge_endpoints))
+            SubElement(cond_elem, "action", application="bridge", data=f"[leg_timeout=25]user/{target}@{domain_name}")
             add_voicemail_block(cond_elem, target, domain_name, tenant_id)
         elif dest_type == "queue":
             q_row = await execute_query_one(
@@ -771,16 +772,10 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             logger.info(f"Extension {ext_num} has unconditional forward to {cf_dest}")
             SubElement(cond_elem, "action", application="transfer", data=f"{cf_dest} XML {context}")
         else:
-            candidate_domains = [callee_domain]
-            for d in [domain_name, "pbx.terrixai.com", "8.234.117.15", "pbx.aikyamlabs.local"]:
-                if d and d not in candidate_domains:
-                    candidate_domains.append(d)
-            bridge_targets = [f"user/{ext_num}@{d}" for d in candidate_domains]
-            bridge_targets.append(f"user/{ext_num}")
-            bridge_str = ",".join(bridge_targets)
-            logger.info(f"Bridging internal call to endpoints '{bridge_str}' with timeout={timeout}s...")
-            bridge_opts = f"{{ignore_early_media=true,originate_timeout={timeout},call_timeout={timeout},leg_timeout={timeout},continue_on_fail=true}}"
-            SubElement(cond_elem, "action", application="bridge", data=f"{bridge_opts}{bridge_str}")
+            callee_domain = target_ext.get("sip_domain") or domain_name
+            bridge_data = f"{{ignore_early_media=true,originate_timeout={timeout},call_timeout={timeout},leg_timeout={timeout},continue_on_fail=true}}user/{ext_num}@{callee_domain}"
+            logger.info(f"Bridging internal call to endpoint 'user/{ext_num}@{callee_domain}' with timeout={timeout}s...")
+            SubElement(cond_elem, "action", application="bridge", data=bridge_data)
             SubElement(cond_elem, "action", application="transfer", data=f"{fail_target} XML {context}")
 
         # Declare the forward-on-no-answer extension in context if enabled
@@ -811,6 +806,15 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     )
 
     if is_outbound:
+        # Prevent unauthenticated callers in context 'public' from placing outbound PSTN calls
+        if context == "public":
+            logger.warning(f"Rejecting unauthenticated outbound call attempt from context 'public' to '{dest_number}'")
+            ext_elem = SubElement(context_elem, "extension", name="reject_public_outbound")
+            cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
+            SubElement(cond_elem, "action", application="respond", data="403 Forbidden - Outbound Not Allowed from Public Context")
+            SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
+            return format_xml(doc)
+
         # Smart dialed digits formatting:
         # 1. If dialed as 91 + 10 digits (12 digits, Indian E.164 without +), preserve 91...
         # 2. If dialed with outside line prefix 9 followed by local trunk 0 (e.g. 9 + 09930573730 = 12 digits), strip leading 9 -> 09930573730
@@ -947,6 +951,15 @@ def add_voicemail_block(cond_elem: Element, ext_num: str, domain: str, tenant_id
     6. Calls API webhook to record to database and queue email dispatch
     7. Hangs up cleanly
     """
+    # Ensure voicemail & recording directories exist so mod_sndfile never fails to create recording file
+    try:
+        os.makedirs("/var/lib/freeswitch/recordings/voicemail", exist_ok=True)
+        os.makedirs("/var/lib/freeswitch/recordings/prompts", exist_ok=True)
+        if tenant_id:
+            os.makedirs(f"/var/lib/freeswitch/recordings/{tenant_id}", exist_ok=True)
+    except OSError:
+        pass
+
     vm_file = f"/var/lib/freeswitch/recordings/voicemail/{ext_num}_${{uuid}}.wav"
     rec_path = f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav"
 
