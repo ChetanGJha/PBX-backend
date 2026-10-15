@@ -32,6 +32,7 @@ class ConferenceUpdate(BaseModel):
     wait_for_moderator: Optional[bool] = None
     announce_join_leave: Optional[bool] = None
     enabled: Optional[bool] = None
+    tenant_id: Optional[UUID] = None
 
 
 @router.get("")
@@ -108,11 +109,20 @@ async def update_conference(
         raise HTTPException(status_code=403, detail="Access denied")
 
     data = payload.dict(exclude_unset=True)
+    if not current_user.is_super_admin:
+        data.pop("tenant_id", None)
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    fields = [f"{k} = :{k}" for k in data.keys()]
-    params = {k: v for k, v in data.items()}
+    fields = []
+    params = {}
+    for k, v in data.items():
+        if k == "tenant_id":
+            fields.append("tenant_id = CAST(:tenant_id AS uuid)")
+            params["tenant_id"] = str(v)
+        else:
+            fields.append(f"{k} = :{k}")
+            params[k] = v
     params["id"] = str(conf_id)
     query = f"""
         UPDATE conferences

@@ -26,6 +26,14 @@
       <!-- <node type="allow" cidr="192.168.0.0/24"/> -->
     </list>
 
+    <!-- Carrier Trunks & Peering Gateways (Bypass auth-calls challenge) -->
+    <list name="carrier_gateways" default="deny">
+      <node type="allow" cidr="103.132.242.42/32"/>
+      <node type="allow" cidr="10.50.185.0/24"/>
+      <node type="allow" cidr="127.0.0.1/32"/>
+      <node type="allow" cidr="10.0.0.0/8"/>
+    </list>
+
   </network-lists>
 </configuration>
 

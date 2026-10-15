@@ -235,14 +235,33 @@ async def process_cdr_record(cdr_data: dict) -> dict:
             )
             if t_row:
                 tenant_id = str(t_row["id"])
-        if not tenant_id:
-            t_row = await execute_query_one("SELECT id FROM tenants WHERE enabled = true ORDER BY created_at ASC LIMIT 1")
-            if t_row:
-                tenant_id = str(t_row["id"])
 
+    # Fallback to DID match if destination matches a configured tenant DID
+    if not tenant_id and destination:
+        did_match = await execute_query_one(
+            """
+            SELECT tenant_id FROM dids 
+            WHERE (did_number = :dest OR did_number = '+' || :dest OR did_number = TRIM(LEADING '+' FROM :dest))
+              AND enabled = true AND deleted_at IS NULL LIMIT 1
+            """,
+            {"dest": destination}
+        )
+        if did_match and did_match.get("tenant_id"):
+            tenant_id = str(did_match["tenant_id"])
+
+    # Fallback to Extension match if caller is a known extension
+    if not tenant_id and caller_number:
+        ext_match = await execute_query_one(
+            "SELECT tenant_id FROM extensions WHERE extension_number = :ext AND enabled = true AND deleted_at IS NULL LIMIT 1",
+            {"ext": caller_number}
+        )
+        if ext_match and ext_match.get("tenant_id"):
+            tenant_id = str(ext_match["tenant_id"])
+
+    # Drop unauthenticated scanner attacks that have no matching tenant or DID
     if not tenant_id:
-        logger.warning(f"CDR: Unable to determine tenant_id for call {call_uuid}")
-        tenant_id = "00000000-0000-0000-0000-000000000000"
+        logger.info(f"CDR: Ignoring unauthenticated external probe {call_uuid} to '{destination}'")
+        return {"status": "ignored", "reason": "no_tenant_probe", "uuid": call_uuid}
 
     # Parse Timestamps
     start_epoch = int(times.get("created_time") or variables.get("start_epoch") or 0)
@@ -269,9 +288,26 @@ async def process_cdr_record(cdr_data: dict) -> dict:
 
     # Check for Voice Call Recording file
     recording_id = None
-    rec_file = variables.get("recording_file") or f"/var/lib/freeswitch/recordings/{tenant_id}/{call_uuid}.wav"
-    if os.path.exists(rec_file):
-        file_size = os.path.getsize(rec_file)
+    raw_rec_file = variables.get("recording_file") or f"/var/lib/freeswitch/recordings/{tenant_id}/{call_uuid}.wav"
+    expanded_rec = raw_rec_file.replace("${uuid}", call_uuid)
+
+    candidate_files = [
+        expanded_rec,
+        f"/var/lib/freeswitch/recordings/{tenant_id}/{call_uuid}.wav",
+        f"/var/lib/freeswitch/recordings/{call_uuid}.wav",
+        f"/var/lib/freeswitch/recordings/archive/{call_uuid}.wav",
+        f"/var/lib/freeswitch/recordings/voicemail/{call_uuid}.wav",
+        raw_rec_file
+    ]
+
+    matched_file = None
+    for cand in candidate_files:
+        if cand and os.path.exists(cand) and os.path.getsize(cand) > 0:
+            matched_file = cand
+            break
+
+    if matched_file:
+        file_size = os.path.getsize(matched_file)
         recording_id = str(uuid4())
         await execute_query(
             """
@@ -292,11 +328,11 @@ async def process_cdr_record(cdr_data: dict) -> dict:
                 "start_time": start_time,
                 "end_time": end_time,
                 "duration": duration,
-                "file_path": rec_file,
+                "file_path": matched_file,
                 "file_size": file_size
             }
         )
-        logger.info(f"Saved recording {recording_id} for call {call_uuid} (size: {file_size} bytes)")
+        logger.info(f"Saved recording {recording_id} for call {call_uuid} from {matched_file} (size: {file_size} bytes)")
 
     # Insert CDR
     await execute_query(

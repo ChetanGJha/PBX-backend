@@ -94,7 +94,9 @@ app.include_router(xml_curl_router.router)
 
 
 @app.websocket("/ws/reports")
+@app.websocket("/ws/reports/")
 @app.websocket("/ws/events")
+@app.websocket("/ws/events/")
 async def websocket_reports_endpoint(websocket: WebSocket):
     """
     Real-time WebSocket endpoint for CDR events, reports telemetry, and live call metrics.
@@ -109,7 +111,8 @@ async def websocket_reports_endpoint(websocket: WebSocket):
             payload = decode_token(token)
             if payload:
                 user_tenant_id = payload.get("tenant_id")
-                is_admin = (payload.get("role") == "admin") or (user_tenant_id is None)
+                role = str(payload.get("role") or "").lower()
+                is_admin = (role in ("admin", "super_admin", "superadmin")) or (user_tenant_id is None)
         except Exception as e:
             logger.warning(f"WebSocket token decode failure: {e}")
 
@@ -120,10 +123,10 @@ async def websocket_reports_endpoint(websocket: WebSocket):
             if data == "ping":
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
+        await ws_manager.disconnect(websocket)
     except Exception as e:
         logger.warning(f"WebSocket connection error: {e}")
-        ws_manager.disconnect(websocket)
+        await ws_manager.disconnect(websocket)
 
 
 @app.get("/health", tags=["Monitoring"])
