@@ -806,12 +806,33 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     )
 
     if is_outbound:
-        # Prevent unauthenticated callers in context 'public' from placing outbound PSTN calls
-        if context == "public":
-            logger.warning(f"Rejecting unauthenticated outbound call attempt from context 'public' to '{dest_number}'")
+        # Identify caller extension to verify authorization and tenant ownership
+        caller_user = form_data.get("variable_sip_from_user") or caller_id_number
+        caller_ext = None
+        if caller_user:
+            caller_ext = await execute_query_one(
+                """
+                SELECT e.id, e.tenant_id, e.extension_number, e.outbound_caller_id, e.caller_id_name, e.caller_id_number
+                FROM extensions e
+                WHERE e.extension_number = :ext
+                  AND e.enabled = true
+                  AND e.deleted_at IS NULL
+                LIMIT 1
+                """,
+                {"ext": caller_user}
+            )
+            if caller_ext and caller_ext.get("tenant_id"):
+                tenant_id = str(caller_ext["tenant_id"])
+
+        # Prevent unauthorized external callers in context 'public' from placing outbound PSTN calls
+        # Only registered extensions belonging to a tenant are permitted to dial outbound PSTN
+        if context == "public" and not caller_ext:
+            logger.warning(
+                f"Rejecting unauthenticated outbound call attempt from context 'public' by non-extension '{caller_user}' to '{dest_number}'"
+            )
             ext_elem = SubElement(context_elem, "extension", name="reject_public_outbound")
             cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
-            SubElement(cond_elem, "action", application="respond", data="403 Forbidden - Outbound Not Allowed from Public Context")
+            SubElement(cond_elem, "action", application="respond", data="403 Forbidden - Outbound Not Allowed")
             SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
             return format_xml(doc)
 
@@ -889,6 +910,16 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
                 if target_port != 5060 and ":" not in str(target_host):
                     target_host = f"{target_host}:{target_port}"
 
+        # 4. Fallback to any enabled gateway in gateways table
+        if not target_gw_name:
+            any_gw = await execute_query_one(
+                "SELECT name as gateway_name, proxy, profile FROM gateways WHERE enabled = true AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1"
+            )
+            if any_gw:
+                target_gw_name = any_gw["gateway_name"]
+                target_host = any_gw.get("proxy")
+                target_profile = any_gw.get("profile")
+
         # If tenant has no gateway assigned: OUTBOUND CALLS MUST FAIL!
         if not target_gw_name:
             logger.warning(
@@ -921,15 +952,38 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data=f"recording_file={rec_path}")
         SubElement(cond_elem, "action", application="record_session", data=rec_path)
 
-        # Set Caller ID from extension or tenant
-        SubElement(cond_elem, "action", application="set", data="effective_caller_id_name=${outbound_caller_id_name}")
-        SubElement(cond_elem, "action", application="set", data="effective_caller_id_number=${outbound_caller_id_number}")
+        # Determine outbound Caller ID (prioritize extension outbound_caller_id, then tenant DID, then extension number)
+        outbound_cli = caller_ext.get("outbound_caller_id") if caller_ext else None
+        if not outbound_cli and tenant_id:
+            did_row = await execute_query_one(
+                "SELECT did_number FROM dids WHERE tenant_id = CAST(:tid AS uuid) AND enabled = true AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1",
+                {"tid": tenant_id}
+            )
+            if did_row and did_row.get("did_number"):
+                outbound_cli = did_row["did_number"]
+
+        if outbound_cli:
+            SubElement(cond_elem, "action", application="set", data=f"effective_caller_id_number={outbound_cli}")
+            SubElement(cond_elem, "action", application="set", data=f"outbound_caller_id_number={outbound_cli}")
+        else:
+            SubElement(cond_elem, "action", application="set", data="effective_caller_id_number=${outbound_caller_id_number}")
+
+        cli_name = (caller_ext.get("caller_id_name") or caller_id_name or caller_id_number) if caller_ext else (caller_id_name or caller_id_number)
+        if cli_name:
+            SubElement(cond_elem, "action", application="set", data=f"effective_caller_id_name={cli_name}")
+            SubElement(cond_elem, "action", application="set", data=f"outbound_caller_id_name={cli_name}")
+        else:
+            SubElement(cond_elem, "action", application="set", data="effective_caller_id_name=${outbound_caller_id_name}")
 
         # Primary: bridge via registered Sofia gateway
         # Failover: if gateway registration is down/invalid, failover to direct SIP URI via target profile
         bridge_targets = [f"sofia/gateway/{target_gw_name}/{dialed_digits}"]
+        if dialed_digits.startswith("+"):
+            bridge_targets.append(f"sofia/gateway/{target_gw_name}/{dialed_digits.lstrip('+')}")
         if target_host:
             bridge_targets.append(f"sofia/{target_profile}/{dialed_digits}@{target_host}")
+            if dialed_digits.startswith("+"):
+                bridge_targets.append(f"sofia/{target_profile}/{dialed_digits.lstrip('+')}@{target_host}")
         
         bridge_data = "|".join(bridge_targets)
         logger.info(f"Outbound route bridge data: '{bridge_data}'")
