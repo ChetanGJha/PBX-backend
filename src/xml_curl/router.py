@@ -235,14 +235,33 @@ async def process_cdr_record(cdr_data: dict) -> dict:
             )
             if t_row:
                 tenant_id = str(t_row["id"])
-        if not tenant_id:
-            t_row = await execute_query_one("SELECT id FROM tenants WHERE enabled = true ORDER BY created_at ASC LIMIT 1")
-            if t_row:
-                tenant_id = str(t_row["id"])
 
+    # Fallback to DID match if destination matches a configured tenant DID
+    if not tenant_id and destination:
+        did_match = await execute_query_one(
+            """
+            SELECT tenant_id FROM dids 
+            WHERE (did_number = :dest OR did_number = '+' || :dest OR did_number = TRIM(LEADING '+' FROM :dest))
+              AND enabled = true AND deleted_at IS NULL LIMIT 1
+            """,
+            {"dest": destination}
+        )
+        if did_match and did_match.get("tenant_id"):
+            tenant_id = str(did_match["tenant_id"])
+
+    # Fallback to Extension match if caller is a known extension
+    if not tenant_id and caller_number:
+        ext_match = await execute_query_one(
+            "SELECT tenant_id FROM extensions WHERE extension_number = :ext AND enabled = true AND deleted_at IS NULL LIMIT 1",
+            {"ext": caller_number}
+        )
+        if ext_match and ext_match.get("tenant_id"):
+            tenant_id = str(ext_match["tenant_id"])
+
+    # Drop unauthenticated scanner attacks that have no matching tenant or DID
     if not tenant_id:
-        logger.warning(f"CDR: Unable to determine tenant_id for call {call_uuid}")
-        tenant_id = "00000000-0000-0000-0000-000000000000"
+        logger.info(f"CDR: Ignoring unauthenticated external probe {call_uuid} to '{destination}'")
+        return {"status": "ignored", "reason": "no_tenant_probe", "uuid": call_uuid}
 
     # Parse Timestamps
     start_epoch = int(times.get("created_time") or variables.get("start_epoch") or 0)

@@ -78,13 +78,6 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         if t_row:
             tenant_id = str(t_row["id"])
 
-    if not tenant_id:
-        t_row = await execute_query_one(
-            "SELECT id FROM tenants WHERE enabled = true AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1"
-        )
-        if t_row:
-            tenant_id = str(t_row["id"])
-
     # Build XML Document
     doc = Element("document", type="freeswitch/xml")
     section = SubElement(doc, "section", name="dialplan", description="Dynamic Multi-Tenant Dialplan")

@@ -699,10 +699,10 @@ async def get_dashboard_metrics(
     # 3. Traffic Summary
     traffic_query = """
         SELECT 
-            COUNT(*) FILTER (WHERE direction = 'inbound') as in_total,
+            COUNT(*) FILTER (WHERE direction = 'inbound' AND (hangup_cause IS NULL OR hangup_cause != 'CALL_REJECTED')) as in_total,
             COUNT(*) FILTER (WHERE direction = 'inbound' AND (billsec > 0 OR hangup_cause = 'NORMAL_CLEARING')) as in_answered,
             COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND hangup_cause IN ('NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE', 'NORMAL_TEMPORARY_FAILURE')) as in_unanswered,
-            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE', 'NORMAL_TEMPORARY_FAILURE'))) as in_failed,
+            COUNT(*) FILTER (WHERE direction = 'inbound' AND billsec = 0 AND (hangup_cause IS NULL OR hangup_cause NOT IN ('CALL_REJECTED', 'NORMAL_CLEARING', 'NO_ANSWER', 'USER_BUSY', 'ORIGINATOR_CANCEL', 'NO_USER_RESPONSE', 'NORMAL_TEMPORARY_FAILURE'))) as in_failed,
 
             COUNT(*) FILTER (WHERE direction = 'outbound' OR (direction != 'internal' AND direction != 'inbound' AND LENGTH(destination) > 6)) as out_total,
             COUNT(*) FILTER (WHERE (direction = 'outbound' OR (direction != 'internal' AND direction != 'inbound' AND LENGTH(destination) > 6)) AND (billsec > 0 OR hangup_cause = 'NORMAL_CLEARING')) as out_answered,
@@ -740,7 +740,7 @@ async def get_dashboard_metrics(
         FROM (
             SELECT 
                 date_trunc('hour', start_time) as hr,
-                COUNT(*) FILTER (WHERE direction = 'inbound') as in_cnt,
+                COUNT(*) FILTER (WHERE direction = 'inbound' AND (hangup_cause IS NULL OR hangup_cause != 'CALL_REJECTED')) as in_cnt,
                 COUNT(*) FILTER (WHERE direction = 'outbound' OR LENGTH(destination) > 6) as out_cnt
             FROM cdr
             WHERE start_time >= NOW() - INTERVAL '30 days'
