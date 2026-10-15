@@ -78,3 +78,79 @@ def ensure_voicemail_prompt(ext_num: str) -> str:
         return DEFAULT_FALLBACK
 
     return target_wav
+
+
+IVR_WELCOME_FALLBACK = "/var/lib/freeswitch/recordings/prompts/ivr_welcome.wav"
+
+
+def ensure_ivr_prompt() -> str:
+    """
+    Ensures a default IVR welcome prompt audio file exists:
+    'Thank you for calling. Please dial your party's extension, or press a menu option, or wait on the line.'
+
+    Returns the absolute path to the 8kHz mono WAV audio file, or a tone_stream fallback.
+    """
+    try:
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+    target_wav = IVR_WELCOME_FALLBACK
+    if os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+        return target_wav
+
+    phrase = "Thank you for calling. Please dial your party's extension, or press a menu option, or wait on the line to be connected."
+
+    # Method 1: Google TTS via httpx + ffmpeg conversion to 8000Hz mono WAV
+    try:
+        url = "https://translate.google.com/translate_tts"
+        params = {"ie": "UTF-8", "q": phrase, "tl": "en", "client": "tw-ob"}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = httpx.get(url, params=params, headers=headers, timeout=5.0)
+        if r.status_code == 200 and len(r.content) > 500:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", target_wav],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = proc.communicate(input=r.content)
+            if proc.returncode == 0 and os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+                logger.info(f"Successfully generated dynamic IVR welcome prompt: {target_wav}")
+                return target_wav
+    except Exception as e:
+        logger.warning(f"Google TTS generation failed for IVR welcome prompt: {e}")
+
+    # Method 2: gTTS library if installed
+    try:
+        from gtts import gTTS
+        import tempfile
+        tts = gTTS(text=phrase, lang="en", tld="com")
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+            temp_mp3 = tf.name
+        tts.save(temp_mp3)
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", temp_mp3, "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", target_wav],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+        if os.path.exists(temp_mp3):
+            os.remove(temp_mp3)
+        if os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+            logger.info("Successfully generated IVR welcome prompt via gTTS")
+            return target_wav
+    except Exception as e:
+        logger.warning(f"gTTS library generation failed for IVR welcome prompt: {e}")
+
+    # Method 3: Check FreeSWITCH Callie system sounds
+    for callie_path in (
+        "/usr/share/freeswitch/sounds/en/us/callie/ivr/8000/ivr-welcome.wav",
+        "/usr/share/freeswitch/sounds/en/us/callie/ivr/8000/ivr-welcome_to_freeswitch.wav",
+        "/usr/share/freeswitch/sounds/en/us/callie/ivr/8000/ivr-enter_ext_number.wav"
+    ):
+        if os.path.exists(callie_path) and os.path.getsize(callie_path) > 1000:
+            return callie_path
+
+    # Method 4: Return tone_stream if no sound file can be generated
+    return "tone_stream://%(2000,4000,440,480)"

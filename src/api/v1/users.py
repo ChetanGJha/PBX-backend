@@ -1,3 +1,5 @@
+import logging
+from datetime import datetime, timezone
 from typing import Optional, List
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -6,6 +8,8 @@ from pydantic import BaseModel, EmailStr, Field
 from src.core.database import execute_query, execute_query_one, execute_transaction
 from src.core.security import hash_password
 from src.core.permissions import get_current_user, require_roles, CurrentUser
+
+logger = logging.getLogger("pbx.users")
 
 router = APIRouter(prefix="/users", tags=["Users Management"])
 
@@ -105,66 +109,147 @@ async def create_user(
 
     # Check if username or email exists in the tenant context
     if target_tenant:
-        existing = await execute_query_one(
-            "SELECT id, username, email FROM users WHERE tenant_id = CAST(:t_id AS uuid) AND (username = :u OR email = :e) AND deleted_at IS NULL",
-            {"t_id": str(target_tenant), "u": payload.username, "e": payload.email}
+        existing_user = await execute_query_one(
+            "SELECT id, username, email, deleted_at FROM users WHERE tenant_id = CAST(:t_id AS uuid) AND LOWER(username) = LOWER(:u)",
+            {"t_id": str(target_tenant), "u": payload.username.strip()}
+        )
+        existing_email = await execute_query_one(
+            "SELECT id, username, email, deleted_at FROM users WHERE tenant_id = CAST(:t_id AS uuid) AND LOWER(email) = LOWER(:e)",
+            {"t_id": str(target_tenant), "e": payload.email.strip()}
         )
     else:
-        existing = await execute_query_one(
-            "SELECT id, username, email FROM users WHERE tenant_id IS NULL AND (username = :u OR email = :e) AND deleted_at IS NULL",
-            {"u": payload.username, "e": payload.email}
+        existing_user = await execute_query_one(
+            "SELECT id, username, email, deleted_at FROM users WHERE tenant_id IS NULL AND LOWER(username) = LOWER(:u)",
+            {"u": payload.username.strip()}
         )
-    if existing:
-        field = "Username" if existing.get("username", "").lower() == payload.username.lower() else "Email"
+        existing_email = await execute_query_one(
+            "SELECT id, username, email, deleted_at FROM users WHERE tenant_id IS NULL AND LOWER(email) = LOWER(:e)",
+            {"e": payload.email.strip()}
+        )
+
+    # 1. Active username conflict
+    if existing_user and existing_user.get("deleted_at") is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"{field} is already registered in this tenant."
+            detail=f"Username '{payload.username}' is already registered in this tenant."
         )
+
+    # 2. Active email conflict
+    if existing_email and existing_email.get("deleted_at") is None:
+        if not existing_user or str(existing_email["id"]) != str(existing_user["id"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Email '{payload.email}' is already registered in this tenant."
+            )
 
     import json
     pwd_hash = hash_password(payload.password)
     target_role = payload.role.upper()
     modules_json = json.dumps(payload.allowed_modules or [])
 
-    async def create_tx(session):
-        from sqlalchemy.sql import text
-        # Fetch role id
-        role_res = await session.execute(text("SELECT id FROM roles WHERE name = :r"), {"r": target_role})
-        role_row = role_res.fetchone()
-        if not role_row:
-            raise Exception(f"Role '{target_role}' not found in database schema.")
-        role_id = role_row[0]
+    from sqlalchemy.exc import IntegrityError
+    from sqlalchemy.sql import text
 
-        # Insert user
-        user_res = await session.execute(
-            text("""
-            INSERT INTO users (tenant_id, username, email, password_hash, first_name, last_name, allowed_modules)
-            VALUES (:t_id, :username, :email, :pwd_hash, :fn, :ln, CAST(:modules AS jsonb))
-            RETURNING id, created_at::text
-            """),
-            {
-                "t_id": target_tenant,
-                "username": payload.username,
-                "email": payload.email,
-                "pwd_hash": pwd_hash,
-                "fn": payload.first_name,
-                "ln": payload.last_name,
-                "modules": modules_json
-            }
-        )
-        user_row = user_res.fetchone()
-        user_id = user_row[0]
-        created_at_str = user_row[1]
+    # If the user previously existed and was soft-deleted, reactivate them
+    if existing_user and existing_user.get("deleted_at") is not None:
+        async def reactivate_tx(session):
+            role_res = await session.execute(text("SELECT id FROM roles WHERE name = :r"), {"r": target_role})
+            role_row = role_res.fetchone()
+            if not role_row:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Role '{target_role}' not found in database schema.")
+            role_id = role_row[0]
 
-        # Assign user role
-        await session.execute(
-            text("INSERT INTO user_roles (user_id, role_id) VALUES (:u_id, :r_id)"),
-            {"u_id": user_id, "r_id": role_id}
-        )
+            await session.execute(
+                text("""
+                UPDATE users
+                SET deleted_at = NULL,
+                    is_active = true,
+                    username = :username,
+                    email = :email,
+                    password_hash = :pwd_hash,
+                    first_name = :fn,
+                    last_name = :ln,
+                    allowed_modules = CAST(:modules AS jsonb),
+                    updated_at = NOW()
+                WHERE id = :u_id
+                """),
+                {
+                    "u_id": existing_user["id"],
+                    "username": payload.username.strip(),
+                    "email": payload.email.strip(),
+                    "pwd_hash": pwd_hash,
+                    "fn": payload.first_name,
+                    "ln": payload.last_name,
+                    "modules": modules_json
+                }
+            )
+            # Reassign role
+            await session.execute(
+                text("DELETE FROM user_roles WHERE user_id = :u_id"),
+                {"u_id": existing_user["id"]}
+            )
+            await session.execute(
+                text("INSERT INTO user_roles (user_id, role_id) VALUES (:u_id, :r_id)"),
+                {"u_id": existing_user["id"], "r_id": role_id}
+            )
+            return existing_user["id"], str(datetime.now(timezone.utc))
 
-        return user_id, created_at_str
+        try:
+            user_id, created_at_str = await execute_transaction(reactivate_tx)
+        except IntegrityError as ie:
+            err = str(ie).lower()
+            if "email" in err:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Email '{payload.email}' is already in use by another account.")
+            elif "username" in err:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Username '{payload.username}' is already in use.")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unable to recreate user due to a unique constraint conflict.")
+    else:
+        async def create_tx(session):
+            # Fetch role id
+            role_res = await session.execute(text("SELECT id FROM roles WHERE name = :r"), {"r": target_role})
+            role_row = role_res.fetchone()
+            if not role_row:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Role '{target_role}' not found in database schema.")
+            role_id = role_row[0]
 
-    user_id, created_at_str = await execute_transaction(create_tx)
+            # Insert user
+            user_res = await session.execute(
+                text("""
+                INSERT INTO users (tenant_id, username, email, password_hash, first_name, last_name, allowed_modules)
+                VALUES (:t_id, :username, :email, :pwd_hash, :fn, :ln, CAST(:modules AS jsonb))
+                RETURNING id, created_at::text
+                """),
+                {
+                    "t_id": target_tenant,
+                    "username": payload.username.strip(),
+                    "email": payload.email.strip(),
+                    "pwd_hash": pwd_hash,
+                    "fn": payload.first_name,
+                    "ln": payload.last_name,
+                    "modules": modules_json
+                }
+            )
+            user_row = user_res.fetchone()
+            user_id = user_row[0]
+            created_at_str = user_row[1]
+
+            # Assign user role
+            await session.execute(
+                text("INSERT INTO user_roles (user_id, role_id) VALUES (:u_id, :r_id)"),
+                {"u_id": user_id, "r_id": role_id}
+            )
+
+            return user_id, created_at_str
+
+        try:
+            user_id, created_at_str = await execute_transaction(create_tx)
+        except IntegrityError as ie:
+            err = str(ie).lower()
+            if "username" in err:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Username '{payload.username}' is already registered in this tenant.")
+            elif "email" in err:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Email '{payload.email}' is already registered in this tenant.")
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A user with this username or email already exists in this tenant.")
 
     # Fetch tenant details
     tenant_info = None

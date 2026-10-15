@@ -27,6 +27,53 @@ VOICEMAIL_CONTINUE_ON_FAIL = (
 
 
 
+def get_beep_file() -> str:
+    beep = "/var/lib/freeswitch/recordings/prompts/beep.wav"
+    if os.path.exists(beep) and os.path.getsize(beep) > 100:
+        return beep
+    return "tone_stream://%(250,50,440)"
+
+
+async def resolve_ivr_prompt(db_audio: Optional[str] = None) -> str:
+    """
+    Resolves the IVR prompt audio file path.
+    Checks:
+    1. Direct file path if exists
+    2. /var/lib/freeswitch/recordings/audio/{db_audio}
+    3. /var/lib/freeswitch/recordings/prompts/{db_audio}
+    4. Database lookup in audio_files table
+    5. Fallback synthesized /var/lib/freeswitch/recordings/prompts/ivr_welcome.wav
+    6. Callie system sounds or tone_stream
+    """
+    if db_audio:
+        db_audio = str(db_audio).strip()
+        if os.path.isabs(db_audio) and os.path.exists(db_audio) and os.path.getsize(db_audio) > 500:
+            return db_audio
+        cand_audio = f"/var/lib/freeswitch/recordings/audio/{db_audio}"
+        if os.path.exists(cand_audio) and os.path.getsize(cand_audio) > 500:
+            return cand_audio
+        cand_prompts = f"/var/lib/freeswitch/recordings/prompts/{db_audio}"
+        if os.path.exists(cand_prompts) and os.path.getsize(cand_prompts) > 500:
+            return cand_prompts
+        try:
+            af = await execute_query_one(
+                "SELECT file_path FROM audio_files WHERE file_name = :a OR id::text = :a OR name = :a LIMIT 1",
+                {"a": db_audio}
+            )
+            if af and af.get("file_path") and os.path.exists(af["file_path"]) and os.path.getsize(af["file_path"]) > 500:
+                return af["file_path"]
+        except Exception:
+            pass
+
+    # Ensure and return default synthesized IVR welcome prompt
+    try:
+        from src.services.voicemail_prompt import ensure_ivr_prompt
+        return ensure_ivr_prompt()
+    except Exception as e:
+        logger.warning(f"Could not ensure IVR prompt: {e}")
+        return "tone_stream://%(2000,4000,440,480)"
+
+
 async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
     """
     Handles section=dialplan XML-CURL requests from FreeSWITCH.
@@ -226,18 +273,15 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         if ivr_menu and ivr_menu.get("timeout"):
             menu_timeout = int(ivr_menu["timeout"]) * 1000
 
-        prompt_file = "/var/lib/freeswitch/recordings/prompts/ivr_welcome.wav"
-        if ivr_menu and ivr_menu.get("greeting_audio"):
-            db_audio = ivr_menu["greeting_audio"]
-            if os.path.exists(f"/var/lib/freeswitch/recordings/prompts/{db_audio}"):
-                prompt_file = f"/var/lib/freeswitch/recordings/prompts/{db_audio}"
+        prompt_file = await resolve_ivr_prompt(ivr_menu.get("greeting_audio") if ivr_menu else None)
+        beep_file = get_beep_file()
 
         # Play IVR Welcome Greeting and capture DTMF (1-4 digits)
         SubElement(
             cond_elem,
             "action",
             application="play_and_get_digits",
-            data=f"1 4 3 {menu_timeout} # {prompt_file} /var/lib/freeswitch/recordings/prompts/beep.wav dtmf_result \\d+"
+            data=f"1 4 3 {menu_timeout} # {prompt_file} {beep_file} dtmf_result \\d+"
         )
         # Transfer caller to ivr_choice_${dtmf_result}
         SubElement(cond_elem, "action", application="transfer", data="ivr_choice_${dtmf_result} XML " + context)
@@ -319,6 +363,35 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         elif key == "9":
             add_voicemail_block(cond_elem, "1001", domain_name, tenant_id)
         else:
+            # Check if IVR has a configured timeout node (key 't' or 'timeout')
+            timeout_node = None
+            if not key and ivr_menu_id:
+                timeout_node = await execute_query_one(
+                    """
+                    SELECT action_type, action_target
+                    FROM ivr_nodes
+                    WHERE ivr_menu_id = CAST(:mid AS uuid) AND dtmf_key IN ('t', 'timeout')
+                    LIMIT 1
+                    """,
+                    {"mid": ivr_menu_id}
+                )
+            if timeout_node:
+                t_act = timeout_node.get("action_type")
+                t_tgt = timeout_node.get("action_target")
+                logger.info(f"IVR Timeout node routed: {t_act}:{t_tgt}")
+                if t_act == "extension":
+                    SubElement(cond_elem, "action", application="transfer", data=f"{t_tgt} XML {context}")
+                    return format_xml(doc)
+                elif t_act == "queue":
+                    SubElement(cond_elem, "action", application="transfer", data=f"{t_tgt or '7777'} XML {context}")
+                    return format_xml(doc)
+                elif t_act == "hunt_group":
+                    SubElement(cond_elem, "action", application="transfer", data=f"{t_tgt or '8888'} XML {context}")
+                    return format_xml(doc)
+                elif t_act == "voicemail":
+                    add_voicemail_block(cond_elem, t_tgt or "1001", domain_name, tenant_id)
+                    return format_xml(doc)
+
             # Fallback for timeout or unrecognized key
             logger.info(f"IVR: Fallback transfer to default 1001")
             SubElement(cond_elem, "action", application="transfer", data=f"1001 XML {context}")
@@ -626,17 +699,14 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             if ivr_row and ivr_row.get("timeout"):
                 menu_timeout = int(ivr_row["timeout"]) * 1000
 
-            prompt_file = "/var/lib/freeswitch/recordings/prompts/ivr_welcome.wav"
-            if ivr_row and ivr_row.get("greeting_audio"):
-                db_audio = ivr_row["greeting_audio"]
-                if os.path.exists(f"/var/lib/freeswitch/recordings/prompts/{db_audio}"):
-                    prompt_file = f"/var/lib/freeswitch/recordings/prompts/{db_audio}"
+            prompt_file = await resolve_ivr_prompt(ivr_row.get("greeting_audio") if ivr_row else None)
+            beep_file = get_beep_file()
 
             SubElement(
                 cond_elem,
                 "action",
                 application="play_and_get_digits",
-                data=f"1 4 3 {menu_timeout} # {prompt_file} /var/lib/freeswitch/recordings/prompts/beep.wav dtmf_result \\d+"
+                data=f"1 4 3 {menu_timeout} # {prompt_file} {beep_file} dtmf_result \\d+"
             )
             SubElement(cond_elem, "action", application="transfer", data="ivr_choice_${dtmf_result} XML " + context)
             SubElement(cond_elem, "action", application="transfer", data="1001 XML " + context)
