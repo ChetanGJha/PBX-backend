@@ -535,6 +535,11 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="hangup_after_bridge=true")
         SubElement(cond_elem, "action", application="export", data="hangup_after_bridge=true")
         SubElement(cond_elem, "action", application="set", data=f"continue_on_fail={VOICEMAIL_CONTINUE_ON_FAIL}")
+        if tenant_id:
+            try:
+                os.makedirs(f"/var/lib/freeswitch/recordings/{tenant_id}", exist_ok=True)
+            except OSError:
+                pass
         SubElement(cond_elem, "action", application="set", data=f"recording_file=/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
         SubElement(cond_elem, "action", application="record_session", data=f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav")
         SubElement(cond_elem, "action", application="set", data="ringback=%(2000,4000,440.0,480.0)")
@@ -743,6 +748,11 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="export", data="sip_contact_user=${destination_number}")
 
         # Record call ONLY upon answer (so no premature early media during ringing)
+        if tenant_id:
+            try:
+                os.makedirs(f"/var/lib/freeswitch/recordings/{tenant_id}", exist_ok=True)
+            except OSError:
+                pass
         rec_path = f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav"
         SubElement(cond_elem, "action", application="set", data=f"recording_file={rec_path}")
         SubElement(cond_elem, "action", application="set", data=f"execute_on_answer=record_session {rec_path}")
@@ -941,6 +951,11 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="set", data="continue_on_fail=NORMAL_TEMPORARY_FAILURE,USER_BUSY,NO_ANSWER,TIMEOUT,NO_ROUTE_DESTINATION")
 
         # Record outbound call session
+        if tenant_id:
+            try:
+                os.makedirs(f"/var/lib/freeswitch/recordings/{tenant_id}", exist_ok=True)
+            except OSError:
+                pass
         rec_path = f"/var/lib/freeswitch/recordings/{tenant_id}/${{uuid}}.wav"
         SubElement(cond_elem, "action", application="set", data=f"recording_file={rec_path}")
         SubElement(cond_elem, "action", application="record_session", data=rec_path)
