@@ -62,7 +62,7 @@ class TestConferenceDialplan(unittest.IsolatedAsyncioTestCase):
             self.assertIn('application="conference"', xml_res)
             self.assertIn("+flags{moderator}", xml_res)
 
-    async def test_conference_participant_pin_entry(self):
+    async def test_conference_participant_pin_entry_no_moderator_drops(self):
         form_data = {
             "Caller-Context": "default",
             "Caller-Destination-Number": "conf_exec_3000_1234",
@@ -86,9 +86,42 @@ class TestConferenceDialplan(unittest.IsolatedAsyncioTestCase):
                 return mock_conf
             return None
 
-        with patch("src.xml_curl.dialplan.execute_query_one", side_effect=mock_db):
+        with patch("src.xml_curl.dialplan.execute_query_one", side_effect=mock_db), \
+             patch("src.xml_curl.dialplan.get_conference_live_status", return_value={"has_moderator": False, "member_count": 0, "members": []}):
+            xml_res = await handle_dialplan_request(form_data)
+            self.assertIn("conf_no_moderator.wav", xml_res)
+            self.assertIn('application="hangup"', xml_res)
+            self.assertNotIn('application="conference"', xml_res)
+
+    async def test_conference_participant_pin_entry_with_moderator_announces_count(self):
+        form_data = {
+            "Caller-Context": "default",
+            "Caller-Destination-Number": "conf_exec_3000_1234",
+            "Caller-Caller-ID-Number": "1001",
+            "domain": "pbx.aikyamlabs.local",
+            "variable_tenant_id": "tid-1"
+        }
+        mock_conf = {
+            "id": "conf-uuid",
+            "name": "Team_Standup",
+            "extension_number": "3000",
+            "pin": "1234",
+            "moderator_pin": "9999",
+            "record_conference": False,
+            "tenant_id": "tid-1"
+        }
+
+        async def mock_db(query, params=None):
+            q = query.lower()
+            if "from conferences" in q:
+                return mock_conf
+            return None
+
+        with patch("src.xml_curl.dialplan.execute_query_one", side_effect=mock_db), \
+             patch("src.xml_curl.dialplan.get_conference_live_status", return_value={"has_moderator": True, "member_count": 2, "members": [{}]}):
             xml_res = await handle_dialplan_request(form_data)
             self.assertIn('application="conference"', xml_res)
+            self.assertTrue("conf_participant_3.wav" in xml_res or "say:en:number:pronounced:3" in xml_res)
             self.assertNotIn("+flags{moderator}", xml_res)
 
 if __name__ == "__main__":

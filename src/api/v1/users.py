@@ -90,10 +90,20 @@ async def list_users(
         query += " AND u.tenant_id = :tenant_id"
         params["tenant_id"] = target_tenant
 
-    query += " ORDER BY u.created_at DESC"
-
     rows = await execute_query(query, params)
-    return [dict(r) for r in rows]
+    res = []
+    for r in rows:
+        d = dict(r)
+        raw_mods = d.get("allowed_modules")
+        if isinstance(raw_mods, str):
+            try:
+                d["allowed_modules"] = json.loads(raw_mods)
+            except Exception:
+                d["allowed_modules"] = []
+        elif raw_mods is None:
+            d["allowed_modules"] = []
+        res.append(d)
+    return res
 
 
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)

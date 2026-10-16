@@ -295,6 +295,88 @@ def ensure_wav_format(audio_path: str) -> str:
     if os.path.exists(wav_path):
         return wav_path
 
-    return audio_path
+def ensure_conference_no_moderator_prompt() -> str:
+    """
+    Ensures an audio prompt exists informing participant that no moderator is present:
+    'No moderator is currently present in this conference. Please try again later. Goodbye.'
+    Returns absolute path or Callie fallback.
+    """
+    try:
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+    target_wav = os.path.join(PROMPTS_DIR, "conf_no_moderator.wav")
+    if os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+        return target_wav
+
+    phrase = "No moderator is currently present in this conference. Please try again later. Goodbye."
+    try:
+        url = "https://translate.google.com/translate_tts"
+        params = {"ie": "UTF-8", "q": phrase, "tl": "en", "client": "tw-ob"}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = httpx.get(url, params=params, headers=headers, timeout=5.0)
+        if r.status_code == 200 and len(r.content) > 500:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", target_wav],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            proc.communicate(input=r.content)
+            if proc.returncode == 0 and os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+                logger.info(f"Successfully generated conference no moderator prompt: {target_wav}")
+                return target_wav
+    except Exception as e:
+        logger.warning(f"Google TTS generation failed for conf no moderator prompt: {e}")
+
+    # Check Callie system sounds first
+    for callie_path in (
+        "/usr/share/freeswitch/sounds/en/us/callie/conference/8000/conf-alone.wav",
+        "/usr/share/freeswitch/sounds/en/us/callie/conference/conf-alone.wav"
+    ):
+        if os.path.exists(callie_path) and os.path.getsize(callie_path) > 1000:
+            return callie_path
+
+    return target_wav
+
+
+def ensure_conference_participant_count_prompt(count: int) -> str:
+    """
+    Ensures an audio prompt exists announcing the participant position:
+    'You are participant number {count} in the conference.'
+    Returns absolute path or FreeSWITCH say syntax fallback.
+    """
+    try:
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+    target_wav = os.path.join(PROMPTS_DIR, f"conf_participant_{count}.wav")
+    if os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+        return target_wav
+
+    phrase = f"You are participant number {count} in the conference."
+    try:
+        url = "https://translate.google.com/translate_tts"
+        params = {"ie": "UTF-8", "q": phrase, "tl": "en", "client": "tw-ob"}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = httpx.get(url, params=params, headers=headers, timeout=5.0)
+        if r.status_code == 200 and len(r.content) > 500:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", target_wav],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            proc.communicate(input=r.content)
+            if proc.returncode == 0 and os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+                logger.info(f"Successfully generated conference participant count prompt for {count}: {target_wav}")
+                return target_wav
+    except Exception as e:
+        logger.warning(f"Google TTS generation failed for participant count prompt {count}: {e}")
+
+    return f"say:en:number:pronounced:{count}"
+
 
 

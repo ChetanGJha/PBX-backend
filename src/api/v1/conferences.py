@@ -5,6 +5,11 @@ from pydantic import BaseModel, Field
 
 from src.core.database import execute_query, execute_query_one
 from src.core.permissions import get_current_user, require_roles, CurrentUser
+from src.services.conference_service import (
+    get_conference_live_status,
+    terminate_conference,
+    kick_conference_member
+)
 
 router = APIRouter(prefix="/conferences", tags=["Audio & Video Conferences"])
 
@@ -56,6 +61,41 @@ async def list_conferences(
     query += " ORDER BY c.extension_number ASC"
     rows = await execute_query(query, params)
     return [dict(r) for r in rows]
+
+
+@router.get("/live")
+async def list_live_conferences(
+    tenant_id: Optional[UUID] = None,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Returns real-time status of all conferences (active calls, participants, moderator presence).
+    """
+    target_tenant = tenant_id if current_user.is_super_admin else current_user.tenant_id
+
+    query = """
+        SELECT c.id, c.tenant_id, c.name, c.extension_number, c.pin, c.moderator_pin,
+               c.max_members, c.record_conference, c.enabled, t.name as tenant_name
+        FROM conferences c
+        LEFT JOIN tenants t ON c.tenant_id = t.id
+        WHERE c.enabled = true
+    """
+    params = {}
+    if target_tenant:
+        query += " AND c.tenant_id = CAST(:tenant_id AS uuid)"
+        params["tenant_id"] = str(target_tenant)
+    query += " ORDER BY c.extension_number ASC"
+
+    rows = await execute_query(query, params)
+    result = []
+    for r in rows:
+        conf_dict = dict(r)
+        conf_name = conf_dict.get("name") or f"conf_{conf_dict.get('extension_number')}"
+        live_status = get_conference_live_status(conf_name)
+        conf_dict["live"] = live_status
+        result.append(conf_dict)
+    return result
+
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -151,3 +191,88 @@ async def delete_conference(
 
     await execute_query("DELETE FROM conferences WHERE id = CAST(:id AS uuid)", {"id": str(conf_id)})
     return None
+
+
+@router.get("/{conf_id}/live")
+async def get_conference_live(
+    conf_id: UUID,
+    current_user: CurrentUser = Depends(get_current_user)
+):
+    """
+    Returns real-time status of a specific conference room.
+    """
+    conf = await execute_query_one(
+        "SELECT id, tenant_id, name, extension_number, pin, moderator_pin FROM conferences WHERE id = CAST(:id AS uuid)",
+        {"id": str(conf_id)}
+    )
+    if not conf:
+        raise HTTPException(status_code=404, detail="Conference room not found")
+    if not current_user.is_super_admin and str(conf["tenant_id"]) != str(current_user.tenant_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    conf_name = conf.get("name") or f"conf_{conf.get('extension_number')}"
+    live_status = get_conference_live_status(conf_name)
+    return {
+        "id": conf["id"],
+        "name": conf["name"],
+        "extension_number": conf["extension_number"],
+        "live": live_status
+    }
+
+
+@router.post("/{conf_id}/terminate")
+@router.post("/{conf_id}/cancel")
+async def terminate_conference_endpoint(
+    conf_id: UUID,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Immediately drops/cancels all active calls in the conference room.
+    Only tenant admins and super admins can execute this.
+    """
+    conf = await execute_query_one(
+        "SELECT id, tenant_id, name, extension_number FROM conferences WHERE id = CAST(:id AS uuid)",
+        {"id": str(conf_id)}
+    )
+    if not conf:
+        raise HTTPException(status_code=404, detail="Conference room not found")
+    if not current_user.is_super_admin and str(conf["tenant_id"]) != str(current_user.tenant_id):
+        raise HTTPException(status_code=403, detail="Access denied: Only tenant admin can cancel conference calls")
+
+    conf_name = conf.get("name") or f"conf_{conf.get('extension_number')}"
+    success = terminate_conference(conf_name)
+    return {
+        "status": "terminated" if success else "failed",
+        "conference_id": str(conf_id),
+        "message": f"Conference '{conf_name}' disconnected successfully."
+    }
+
+
+@router.post("/{conf_id}/kick/{member_id}")
+async def kick_conference_member_endpoint(
+    conf_id: UUID,
+    member_id: str,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Hangs up and drops a specific participant from the active conference call.
+    Only tenant admins and super admins can execute this.
+    """
+    conf = await execute_query_one(
+        "SELECT id, tenant_id, name, extension_number FROM conferences WHERE id = CAST(:id AS uuid)",
+        {"id": str(conf_id)}
+    )
+    if not conf:
+        raise HTTPException(status_code=404, detail="Conference room not found")
+    if not current_user.is_super_admin and str(conf["tenant_id"]) != str(current_user.tenant_id):
+        raise HTTPException(status_code=403, detail="Access denied: Only tenant admin can drop conference participants")
+
+    conf_name = conf.get("name") or f"conf_{conf.get('extension_number')}"
+    kick_conference_member(conf_name, member_id)
+    return {
+        "status": "kicked",
+        "conference_id": str(conf_id),
+        "member_id": member_id,
+        "message": f"Member {member_id} dropped from conference '{conf_name}'."
+    }
+
