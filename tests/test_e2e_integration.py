@@ -162,15 +162,17 @@ class TestEndToEndSubProject1(unittest.IsolatedAsyncioTestCase):
             self.assertIn('data="Executive Room@default+flags{moderator}"', xml_mod)
             self.assertIn('application="record_session"', xml_mod)
 
-            # Execution with Participant PIN
-            xml_part = await handle_dialplan_request({
-                "Caller-Context": "default",
-                "Caller-Destination-Number": "conf_exec_3500_1234",
-                "domain": "pbx.test.local",
-                "variable_tenant_id": "tid-e2e"
-            })
-            self.assertIn('data="Executive Room@default"', xml_part)
-            self.assertNotIn('+flags{moderator}', xml_part)
+            # Execution with Participant PIN (moderator present)
+            with patch("src.xml_curl.dialplan.get_conference_live_status", return_value={"has_moderator": True, "member_count": 1, "members": [{}]}):
+                xml_part = await handle_dialplan_request({
+                    "Caller-Context": "default",
+                    "Caller-Destination-Number": "conf_exec_3500_1234",
+                    "domain": "pbx.test.local",
+                    "variable_tenant_id": "tid-e2e"
+                })
+                self.assertIn('data="Executive Room@default"', xml_part)
+                self.assertTrue("conf_participant_2.wav" in xml_part or "say:en:number:pronounced:2" in xml_part)
+                self.assertNotIn('+flags{moderator}', xml_part)
 
             # Execution with Invalid PIN
             xml_inv = await handle_dialplan_request({

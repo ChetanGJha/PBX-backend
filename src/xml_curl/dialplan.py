@@ -8,8 +8,11 @@ from src.services.voicemail_prompt import (
     ensure_voicemail_prompt,
     ensure_conference_pin_prompt,
     ensure_conference_bad_pin_prompt,
+    ensure_conference_no_moderator_prompt,
+    ensure_conference_participant_count_prompt,
     ensure_wav_format
 )
+from src.services.conference_service import get_conference_live_status
 
 logger = logging.getLogger("pbx.xml_curl.dialplan")
 
@@ -460,12 +463,21 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             if c_mod_pin and entered_pin == c_mod_pin:
                 logger.info(f"Joining conference '{conf_name}' as MODERATOR")
                 SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default+flags{{moderator}}")
-            elif c_part_pin and entered_pin == c_part_pin:
-                logger.info(f"Joining conference '{conf_name}' as PARTICIPANT")
-                SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
-            elif not c_mod_pin and not c_part_pin:
-                logger.info(f"Joining open conference '{conf_name}'")
-                SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
+            elif (c_part_pin and entered_pin == c_part_pin) or (not c_mod_pin and not c_part_pin):
+                # Participant join path - verify moderator presence and announce participant count
+                live_status = get_conference_live_status(conf_name)
+                wait_mod = bool(conf_row.get("wait_for_moderator")) or bool(c_mod_pin)
+                if wait_mod and not live_status["has_moderator"]:
+                    logger.warning(f"Participant rejected from conference '{conf_name}': No moderator present in room")
+                    no_mod_audio = ensure_conference_no_moderator_prompt()
+                    SubElement(cond_elem, "action", application="playback", data=no_mod_audio)
+                    SubElement(cond_elem, "action", application="hangup", data="NORMAL_CLEARING")
+                else:
+                    participant_number = live_status["member_count"] + 1
+                    logger.info(f"Participant entering conference '{conf_name}' as member #{participant_number}")
+                    count_audio = ensure_conference_participant_count_prompt(participant_number)
+                    SubElement(cond_elem, "action", application="playback", data=count_audio)
+                    SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
             else:
                 logger.warning(f"Invalid conference PIN '{entered_pin}' for room '{conf_name}'")
                 bad_pin_audio = ensure_conference_bad_pin_prompt()

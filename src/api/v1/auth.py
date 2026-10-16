@@ -187,6 +187,9 @@ async def get_me(current_user: CurrentUser = Depends(get_current_user)):
         "first_name": user.get("first_name"),
         "last_name": user.get("last_name"),
         "role": user.get("role_name"),
+        "tenant_id": str(user["tenant_id"]) if user.get("tenant_id") else None,
+        "tenant_domain": user.get("tenant_domain"),
+        "sip_domain": user.get("sip_domain"),
         "allowed_modules": raw_modules,
         "tenant": {
             "id": str(user["tenant_id"]) if user["tenant_id"] else None,
