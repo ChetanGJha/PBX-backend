@@ -256,3 +256,45 @@ def ensure_conference_bad_pin_prompt() -> str:
 
     return "conference/conf-bad-pin.wav"
 
+
+def ensure_wav_format(audio_path: str) -> str:
+    """
+    If audio_path points to an MP3 or non-WAV format, checks if an 8000Hz 16-bit mono
+    WAV companion already exists or transcodes it using ffmpeg.
+    Returns the path to the playable WAV file for FreeSWITCH.
+    """
+    if not audio_path or not isinstance(audio_path, str):
+        return audio_path
+
+    audio_path = audio_path.strip()
+    if audio_path.startswith("tone_stream://") or audio_path.startswith("silence_stream://") or audio_path.startswith("say:"):
+        return audio_path
+
+    base, ext = os.path.splitext(audio_path)
+    if ext.lower() == ".wav":
+        return audio_path
+
+    wav_path = f"{base}.wav"
+    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
+        return wav_path
+
+    if os.path.exists(audio_path) and os.path.getsize(audio_path) > 500:
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-y", "-i", audio_path, "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", wav_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10.0
+            )
+            if proc.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
+                logger.info(f"Successfully transcoded {audio_path} -> {wav_path} for FreeSWITCH playback")
+                return wav_path
+        except Exception as e:
+            logger.warning(f"Failed to transcode {audio_path} to WAV: {e}")
+
+    if os.path.exists(wav_path):
+        return wav_path
+
+    return audio_path
+
+

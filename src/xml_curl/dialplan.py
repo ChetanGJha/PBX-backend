@@ -7,7 +7,8 @@ from src.core.database import execute_query_one, execute_query
 from src.services.voicemail_prompt import (
     ensure_voicemail_prompt,
     ensure_conference_pin_prompt,
-    ensure_conference_bad_pin_prompt
+    ensure_conference_bad_pin_prompt,
+    ensure_wav_format
 )
 
 logger = logging.getLogger("pbx.xml_curl.dialplan")
@@ -42,7 +43,7 @@ async def resolve_ivr_prompt(db_audio: Optional[str] = None) -> str:
     """
     Resolves the IVR prompt audio file path.
     Checks:
-    1. Direct file path if exists
+    1. Direct file path if exists (transcodes MP3/OGG to 8kHz mono WAV)
     2. /var/lib/freeswitch/recordings/audio/{db_audio}
     3. /var/lib/freeswitch/recordings/prompts/{db_audio}
     4. Database lookup in audio_files table
@@ -52,22 +53,35 @@ async def resolve_ivr_prompt(db_audio: Optional[str] = None) -> str:
     if db_audio:
         db_audio = str(db_audio).strip()
         if os.path.isabs(db_audio) and os.path.exists(db_audio) and os.path.getsize(db_audio) > 500:
-            return db_audio
+            return ensure_wav_format(db_audio)
         cand_audio = f"/var/lib/freeswitch/recordings/audio/{db_audio}"
         if os.path.exists(cand_audio) and os.path.getsize(cand_audio) > 500:
-            return cand_audio
+            return ensure_wav_format(cand_audio)
         cand_prompts = f"/var/lib/freeswitch/recordings/prompts/{db_audio}"
         if os.path.exists(cand_prompts) and os.path.getsize(cand_prompts) > 500:
-            return cand_prompts
+            return ensure_wav_format(cand_prompts)
         try:
             af = await execute_query_one(
                 "SELECT file_path FROM audio_files WHERE file_name = :a OR id::text = :a OR name = :a LIMIT 1",
                 {"a": db_audio}
             )
-            if af and af.get("file_path") and os.path.exists(af["file_path"]) and os.path.getsize(af["file_path"]) > 500:
-                return af["file_path"]
+            if af and af.get("file_path"):
+                fp = af["file_path"]
+                if os.path.exists(fp) and os.path.getsize(fp) > 500:
+                    return ensure_wav_format(fp)
+                base_fp, _ = os.path.splitext(fp)
+                cand_wav = f"{base_fp}.wav"
+                if os.path.exists(cand_wav) and os.path.getsize(cand_wav) > 500:
+                    return cand_wav
         except Exception:
             pass
+
+        # Check if an 8kHz WAV equivalent exists in audio directory
+        base_a, ext_a = os.path.splitext(db_audio)
+        if ext_a.lower() != ".wav":
+            cand_converted = f"/var/lib/freeswitch/recordings/audio/{base_a}.wav"
+            if os.path.exists(cand_converted) and os.path.getsize(cand_converted) > 500:
+                return cand_converted
 
     # Ensure and return default synthesized IVR welcome prompt
     try:
@@ -280,12 +294,15 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         prompt_file = await resolve_ivr_prompt(ivr_menu.get("greeting_audio") if ivr_menu else None)
         beep_file = get_beep_file()
 
-        # Play IVR Welcome Greeting and capture DTMF (1-4 digits)
+        # Flush DTMF queue so residual line noise doesn't prematurely terminate IVR
+        SubElement(cond_elem, "action", application="flush_dtmf")
+
+        # Play IVR Welcome Greeting and capture DTMF (1-4 digits, with 3000ms inter-digit timeout)
         SubElement(
             cond_elem,
             "action",
             application="play_and_get_digits",
-            data=f"1 4 3 {menu_timeout} # {prompt_file} {beep_file} dtmf_result \\d+"
+            data=f"1 4 3 {menu_timeout} # {prompt_file} {beep_file} dtmf_result \\d+ 3000"
         )
         # Transfer caller to ivr_choice_${dtmf_result}
         SubElement(cond_elem, "action", application="transfer", data="ivr_choice_${dtmf_result} XML " + context)
