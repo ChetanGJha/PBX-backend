@@ -1,3 +1,4 @@
+import json
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, Field
@@ -41,7 +42,7 @@ async def login(payload: LoginRequest):
     query = """
         SELECT u.id, u.tenant_id, u.username, u.email, u.password_hash, u.is_active, 
                u.first_name, u.last_name, r.name as role_name, t.domain as tenant_domain,
-               t.sip_domain
+               t.sip_domain, COALESCE(u.allowed_modules, '[]'::jsonb) as allowed_modules
         FROM users u
         LEFT JOIN tenants t ON u.tenant_id = t.id
         LEFT JOIN user_roles ur ON u.id = ur.user_id
@@ -65,13 +66,21 @@ async def login(payload: LoginRequest):
     role_name = user.get("role_name") or "AGENT"
     tenant_id_str = str(user["tenant_id"]) if user["tenant_id"] else None
 
+    raw_modules = user.get("allowed_modules") or []
+    if isinstance(raw_modules, str):
+        try:
+            raw_modules = json.loads(raw_modules)
+        except Exception:
+            raw_modules = []
+
     token_data = {
         "sub": str(user["id"]),
         "username": user["username"],
         "email": user["email"],
         "role": role_name,
         "tenant_id": tenant_id_str,
-        "sip_domain": user.get("sip_domain")
+        "sip_domain": user.get("sip_domain"),
+        "allowed_modules": raw_modules
     }
 
     access_token = create_access_token(token_data)
@@ -91,9 +100,11 @@ async def login(payload: LoginRequest):
             "role": role_name,
             "tenant_id": tenant_id_str,
             "tenant_domain": user.get("tenant_domain"),
-            "sip_domain": user.get("sip_domain")
+            "sip_domain": user.get("sip_domain"),
+            "allowed_modules": raw_modules
         }
     }
+
 
 
 @router.post("/refresh")
@@ -146,12 +157,12 @@ async def refresh_token_endpoint(payload: RefreshTokenRequest):
 @router.get("/me")
 async def get_me(current_user: CurrentUser = Depends(get_current_user)):
     """
-    Get authenticated user profile and active tenant details.
+    Get authenticated user profile, active tenant details, and allowed modules.
     """
     query = """
         SELECT u.id, u.tenant_id, u.username, u.email, u.first_name, u.last_name, u.is_active,
                u.created_at, r.name as role_name, t.name as tenant_name, t.domain as tenant_domain,
-               t.sip_domain
+               t.sip_domain, COALESCE(u.allowed_modules, '[]'::jsonb) as allowed_modules
         FROM users u
         LEFT JOIN tenants t ON u.tenant_id = t.id
         LEFT JOIN user_roles ur ON u.id = ur.user_id
@@ -162,6 +173,13 @@ async def get_me(current_user: CurrentUser = Depends(get_current_user)):
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User profile not found")
 
+    raw_modules = user.get("allowed_modules") or []
+    if isinstance(raw_modules, str):
+        try:
+            raw_modules = json.loads(raw_modules)
+        except Exception:
+            raw_modules = []
+
     return {
         "id": str(user["id"]),
         "username": user["username"],
@@ -169,6 +187,7 @@ async def get_me(current_user: CurrentUser = Depends(get_current_user)):
         "first_name": user.get("first_name"),
         "last_name": user.get("last_name"),
         "role": user.get("role_name"),
+        "allowed_modules": raw_modules,
         "tenant": {
             "id": str(user["tenant_id"]) if user["tenant_id"] else None,
             "name": user.get("tenant_name"),
