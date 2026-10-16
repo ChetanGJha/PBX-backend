@@ -115,6 +115,26 @@ async def upload_audio_file(
             detail="Failed to store audio file on server"
         )
 
+    # Transcode to 8000Hz 16-bit mono WAV for native FreeSWITCH playback
+    final_path = file_path
+    final_name = unique_name
+    wav_path = os.path.splitext(file_path)[0] + ".wav"
+    try:
+        import subprocess
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", file_path, "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15.0
+        )
+        if proc.returncode == 0 and os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
+            final_path = wav_path
+            final_name = os.path.splitext(unique_name)[0] + ".wav"
+            file_size = os.path.getsize(wav_path)
+            logger.info(f"Transcoded uploaded audio {unique_name} -> {final_name} (8kHz mono WAV)")
+    except Exception as conv_err:
+        logger.warning(f"Audio conversion to WAV skipped: {conv_err}")
+
     # Persist metadata in DB
     display_name = os.path.splitext(original_name)[0].replace("_", " ").replace("-", " ").title()
     file_id = str(uuid.uuid4())
@@ -123,9 +143,9 @@ async def upload_audio_file(
         "id": file_id,
         "tenant_id": effective_tenant_id,
         "name": display_name,
-        "file_name": unique_name,
+        "file_name": final_name,
         "category": category,
-        "file_path": file_path,
+        "file_path": final_path,
         "file_size": file_size,
         "created_by": current_user.user_id,
     }

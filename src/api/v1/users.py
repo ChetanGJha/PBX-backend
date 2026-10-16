@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -23,6 +24,18 @@ class UserCreate(BaseModel):
     last_name: Optional[str] = None
     role: str = Field("AGENT", description="Role: TENANT_ADMIN, SUB_ADMIN, SUPERVISOR, AGENT")
     allowed_modules: Optional[List[str]] = Field(default_factory=list)
+
+
+class UserPermissionsUpdate(BaseModel):
+    allowed_modules: List[str] = Field(default_factory=list)
+
+
+class UserUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    role: Optional[str] = None
+    allowed_modules: Optional[List[str]] = None
+    is_active: Optional[bool] = None
 
 
 class UserResponse(BaseModel):
@@ -272,6 +285,146 @@ async def create_user(
         "allowed_modules": payload.allowed_modules or [],
         "is_active": True,
         "created_at": created_at_str
+    }
+
+
+@router.put("/{user_id}/permissions", response_model=UserResponse)
+async def update_user_permissions(
+    user_id: UUID,
+    payload: UserPermissionsUpdate,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Update allowed modules/permissions for a user (Sub-Admin, Supervisor, etc.).
+    """
+    user = await execute_query_one(
+        """
+        SELECT u.id, u.tenant_id, u.username, u.email, u.first_name, u.last_name, u.is_active,
+               COALESCE(r.name, 'AGENT') as role,
+               t.name as tenant_name, t.domain as tenant_domain,
+               u.created_at::text as created_at
+        FROM users u
+        LEFT JOIN tenants t ON u.tenant_id = t.id
+        LEFT JOIN user_roles ur ON u.id = ur.user_id
+        LEFT JOIN roles r ON ur.role_id = r.id
+        WHERE u.id = :u_id AND u.deleted_at IS NULL
+        """,
+        {"u_id": user_id}
+    )
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    target_tenant_str = str(user["tenant_id"]) if user.get("tenant_id") else None
+    current_tenant_str = str(current_user.tenant_id) if current_user.tenant_id else None
+    if current_user.role != "SUPER_ADMIN" and target_tenant_str != current_tenant_str:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot edit permissions of user from another tenant.")
+
+    modules_json = json.dumps(payload.allowed_modules or [])
+    await execute_query(
+        """
+        UPDATE users
+        SET allowed_modules = CAST(:modules AS jsonb), updated_at = NOW()
+        WHERE id = :u_id
+        """,
+        {"u_id": user_id, "modules": modules_json}
+    )
+
+    return {
+        "id": user["id"],
+        "tenant_id": user["tenant_id"],
+        "tenant_name": user.get("tenant_name"),
+        "tenant_domain": user.get("tenant_domain"),
+        "username": user["username"],
+        "email": user["email"],
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "role": user.get("role") or "AGENT",
+        "allowed_modules": payload.allowed_modules,
+        "is_active": user.get("is_active", True),
+        "created_at": user.get("created_at")
+    }
+
+
+@router.put("/{user_id}", response_model=UserResponse)
+async def update_user(
+    user_id: UUID,
+    payload: UserUpdate,
+    current_user: CurrentUser = Depends(require_roles(["SUPER_ADMIN", "TENANT_ADMIN"]))
+):
+    """
+    Update user profile fields, role, allowed modules, or active status.
+    """
+    user = await execute_query_one(
+        """
+        SELECT u.id, u.tenant_id, u.username, u.email, u.first_name, u.last_name, u.is_active,
+               COALESCE(r.name, 'AGENT') as role,
+               t.name as tenant_name, t.domain as tenant_domain,
+               COALESCE(u.allowed_modules, '[]'::jsonb) as allowed_modules,
+               u.created_at::text as created_at
+        FROM users u
+        LEFT JOIN tenants t ON u.tenant_id = t.id
+        LEFT JOIN user_roles ur ON u.id = ur.user_id
+        LEFT JOIN roles r ON ur.role_id = r.id
+        WHERE u.id = :u_id AND u.deleted_at IS NULL
+        """,
+        {"u_id": user_id}
+    )
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+
+    target_tenant_str = str(user["tenant_id"]) if user.get("tenant_id") else None
+    current_tenant_str = str(current_user.tenant_id) if current_user.tenant_id else None
+    if current_user.role != "SUPER_ADMIN" and target_tenant_str != current_tenant_str:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot edit user from another tenant.")
+
+    updates = []
+    params = {"u_id": user_id}
+
+    if payload.first_name is not None:
+        updates.append("first_name = :fn")
+        params["fn"] = payload.first_name
+    if payload.last_name is not None:
+        updates.append("last_name = :ln")
+        params["ln"] = payload.last_name
+    if payload.is_active is not None:
+        updates.append("is_active = :is_act")
+        params["is_act"] = payload.is_active
+    if payload.allowed_modules is not None:
+        updates.append("allowed_modules = CAST(:modules AS jsonb)")
+        params["modules"] = json.dumps(payload.allowed_modules)
+
+    if updates:
+        updates.append("updated_at = NOW()")
+        await execute_query(f"UPDATE users SET {', '.join(updates)} WHERE id = :u_id", params)
+
+    if payload.role and payload.role != user.get("role"):
+        if current_user.role != "SUPER_ADMIN" and payload.role == "SUPER_ADMIN":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cannot assign SUPER_ADMIN role.")
+        role_row = await execute_query_one("SELECT id FROM roles WHERE name = :r", {"r": payload.role})
+        if role_row:
+            await execute_query("DELETE FROM user_roles WHERE user_id = :u_id", {"u_id": user_id})
+            await execute_query("INSERT INTO user_roles (user_id, role_id) VALUES (:u_id, :r_id)", {"u_id": user_id, "r_id": role_row["id"]})
+
+    raw_modules = payload.allowed_modules if payload.allowed_modules is not None else user.get("allowed_modules")
+    if isinstance(raw_modules, str):
+        try:
+            raw_modules = json.loads(raw_modules)
+        except Exception:
+            raw_modules = []
+
+    return {
+        "id": user["id"],
+        "tenant_id": user["tenant_id"],
+        "tenant_name": user.get("tenant_name"),
+        "tenant_domain": user.get("tenant_domain"),
+        "username": user["username"],
+        "email": user["email"],
+        "first_name": payload.first_name if payload.first_name is not None else user.get("first_name"),
+        "last_name": payload.last_name if payload.last_name is not None else user.get("last_name"),
+        "role": payload.role if payload.role else user.get("role") or "AGENT",
+        "allowed_modules": raw_modules or [],
+        "is_active": payload.is_active if payload.is_active is not None else user.get("is_active", True),
+        "created_at": user.get("created_at")
     }
 
 

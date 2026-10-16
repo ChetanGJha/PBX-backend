@@ -7,18 +7,27 @@ from src.core.database import execute_query_one
 security_bearer = HTTPBearer(auto_error=True)
 
 
+import json
+
+
 class CurrentUser:
     """Authenticated user context object."""
-    def __init__(self, user_id: str, tenant_id: Optional[str], username: str, email: str, role: str):
+    def __init__(self, user_id: str, tenant_id: Optional[str], username: str, email: str, role: str, allowed_modules: Optional[List[str]] = None):
         self.user_id = user_id
         self.tenant_id = tenant_id
         self.username = username
         self.email = email
         self.role = role
+        self.allowed_modules = allowed_modules or []
 
     @property
     def is_super_admin(self) -> bool:
         return str(self.role).upper() == "SUPER_ADMIN"
+
+    def has_module_access(self, module: str) -> bool:
+        if self.is_super_admin or str(self.role).upper() == "TENANT_ADMIN":
+            return True
+        return module in self.allowed_modules
 
 
 async def get_current_user(
@@ -45,9 +54,10 @@ async def get_current_user(
             detail="Token payload missing subject user ID",
         )
 
-    # Fetch fresh user record & role from DB
+    # Fetch fresh user record, role & allowed_modules from DB
     query = """
-        SELECT u.id, u.tenant_id, u.username, u.email, u.is_active, r.name as role_name
+        SELECT u.id, u.tenant_id, u.username, u.email, u.is_active, r.name as role_name,
+               COALESCE(u.allowed_modules, '[]'::jsonb) as allowed_modules
         FROM users u
         LEFT JOIN user_roles ur ON u.id = ur.user_id
         LEFT JOIN roles r ON ur.role_id = r.id
@@ -61,12 +71,20 @@ async def get_current_user(
             detail="User account is disabled or does not exist",
         )
 
+    raw_modules = user_row.get("allowed_modules") or []
+    if isinstance(raw_modules, str):
+        try:
+            raw_modules = json.loads(raw_modules)
+        except Exception:
+            raw_modules = []
+
     return CurrentUser(
         user_id=str(user_row["id"]),
         tenant_id=str(user_row["tenant_id"]) if user_row["tenant_id"] else None,
         username=user_row["username"],
         email=user_row["email"],
-        role=user_row.get("role_name") or "AGENT"
+        role=user_row.get("role_name") or "AGENT",
+        allowed_modules=raw_modules
     )
 
 

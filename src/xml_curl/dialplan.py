@@ -4,7 +4,12 @@ import socket
 from xml.etree.ElementTree import Element, SubElement, tostring
 from typing import Dict, Any, List, Optional
 from src.core.database import execute_query_one, execute_query
-from src.services.voicemail_prompt import ensure_voicemail_prompt
+from src.services.voicemail_prompt import (
+    ensure_voicemail_prompt,
+    ensure_conference_pin_prompt,
+    ensure_conference_bad_pin_prompt,
+    ensure_wav_format
+)
 
 logger = logging.getLogger("pbx.xml_curl.dialplan")
 
@@ -38,7 +43,7 @@ async def resolve_ivr_prompt(db_audio: Optional[str] = None) -> str:
     """
     Resolves the IVR prompt audio file path.
     Checks:
-    1. Direct file path if exists
+    1. Direct file path if exists (transcodes MP3/OGG to 8kHz mono WAV)
     2. /var/lib/freeswitch/recordings/audio/{db_audio}
     3. /var/lib/freeswitch/recordings/prompts/{db_audio}
     4. Database lookup in audio_files table
@@ -48,22 +53,35 @@ async def resolve_ivr_prompt(db_audio: Optional[str] = None) -> str:
     if db_audio:
         db_audio = str(db_audio).strip()
         if os.path.isabs(db_audio) and os.path.exists(db_audio) and os.path.getsize(db_audio) > 500:
-            return db_audio
+            return ensure_wav_format(db_audio)
         cand_audio = f"/var/lib/freeswitch/recordings/audio/{db_audio}"
         if os.path.exists(cand_audio) and os.path.getsize(cand_audio) > 500:
-            return cand_audio
+            return ensure_wav_format(cand_audio)
         cand_prompts = f"/var/lib/freeswitch/recordings/prompts/{db_audio}"
         if os.path.exists(cand_prompts) and os.path.getsize(cand_prompts) > 500:
-            return cand_prompts
+            return ensure_wav_format(cand_prompts)
         try:
             af = await execute_query_one(
                 "SELECT file_path FROM audio_files WHERE file_name = :a OR id::text = :a OR name = :a LIMIT 1",
                 {"a": db_audio}
             )
-            if af and af.get("file_path") and os.path.exists(af["file_path"]) and os.path.getsize(af["file_path"]) > 500:
-                return af["file_path"]
+            if af and af.get("file_path"):
+                fp = af["file_path"]
+                if os.path.exists(fp) and os.path.getsize(fp) > 500:
+                    return ensure_wav_format(fp)
+                base_fp, _ = os.path.splitext(fp)
+                cand_wav = f"{base_fp}.wav"
+                if os.path.exists(cand_wav) and os.path.getsize(cand_wav) > 500:
+                    return cand_wav
         except Exception:
             pass
+
+        # Check if an 8kHz WAV equivalent exists in audio directory
+        base_a, ext_a = os.path.splitext(db_audio)
+        if ext_a.lower() != ".wav":
+            cand_converted = f"/var/lib/freeswitch/recordings/audio/{base_a}.wav"
+            if os.path.exists(cand_converted) and os.path.getsize(cand_converted) > 500:
+                return cand_converted
 
     # Ensure and return default synthesized IVR welcome prompt
     try:
@@ -276,12 +294,15 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         prompt_file = await resolve_ivr_prompt(ivr_menu.get("greeting_audio") if ivr_menu else None)
         beep_file = get_beep_file()
 
-        # Play IVR Welcome Greeting and capture DTMF (1-4 digits)
+        # Flush DTMF queue so residual line noise doesn't prematurely terminate IVR
+        SubElement(cond_elem, "action", application="flush_dtmf")
+
+        # Play IVR Welcome Greeting and capture DTMF (1-4 digits, with 3000ms inter-digit timeout)
         SubElement(
             cond_elem,
             "action",
             application="play_and_get_digits",
-            data=f"1 4 3 {menu_timeout} # {prompt_file} {beep_file} dtmf_result \\d+"
+            data=f"1 4 3 {menu_timeout} # {prompt_file} {beep_file} dtmf_result \\d+ 3000"
         )
         # Transfer caller to ivr_choice_${dtmf_result}
         SubElement(cond_elem, "action", application="transfer", data="ivr_choice_${dtmf_result} XML " + context)
@@ -419,6 +440,10 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             conf_name = conf_row.get("name") or f"conf_{conf_ext}"
             c_mod_pin = str(conf_row.get("moderator_pin") or "").strip()
             c_part_pin = str(conf_row.get("pin") or "").strip()
+            if c_mod_pin.lower() in ("none", "null"):
+                c_mod_pin = ""
+            if c_part_pin.lower() in ("none", "null"):
+                c_part_pin = ""
             conf_tid = str(conf_row.get("tenant_id") or tenant_id or "")
             rec_conf = bool(conf_row.get("record_conference"))
 
@@ -443,7 +468,8 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
                 SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
             else:
                 logger.warning(f"Invalid conference PIN '{entered_pin}' for room '{conf_name}'")
-                SubElement(cond_elem, "action", application="playback", data="conference/conf-bad-pin.wav")
+                bad_pin_audio = ensure_conference_bad_pin_prompt()
+                SubElement(cond_elem, "action", application="playback", data=bad_pin_audio)
                 SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
             return format_xml(doc)
 
@@ -462,7 +488,13 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         conf_ext = conf_record.get("extension_number") or dest_number
         conf_name = conf_record.get("name") or f"conf_{conf_ext}"
         conf_tid = str(conf_record.get("tenant_id") or tenant_id or "")
-        has_pin = bool(conf_record.get("pin") or conf_record.get("moderator_pin"))
+        c_part_pin = str(conf_record.get("pin") or "").strip()
+        c_mod_pin = str(conf_record.get("moderator_pin") or "").strip()
+        if c_part_pin.lower() in ("none", "null"):
+            c_part_pin = ""
+        if c_mod_pin.lower() in ("none", "null"):
+            c_mod_pin = ""
+        has_pin = bool(c_part_pin or c_mod_pin)
 
         ext_elem = SubElement(context_elem, "extension", name=f"conf_entry_{conf_ext}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
@@ -472,11 +504,14 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="sleep", data="500")
 
         if has_pin:
+            pin_audio = ensure_conference_pin_prompt()
+            bad_pin_audio = ensure_conference_bad_pin_prompt()
+            SubElement(cond_elem, "action", application="flush_dtmf")
             SubElement(
                 cond_elem,
                 "action",
                 application="play_and_get_digits",
-                data="1 10 3 5000 # conference/conf-pin.wav tone_stream://%(500,0,1000) entered_conf_pin \\d+"
+                data=f"1 10 3 5000 # {pin_audio} {bad_pin_audio} entered_conf_pin \\d+ 3000"
             )
             SubElement(cond_elem, "action", application="transfer", data=f"conf_exec_{conf_ext}_${{entered_conf_pin}} XML {context}")
         else:

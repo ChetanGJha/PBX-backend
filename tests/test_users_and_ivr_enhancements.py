@@ -102,3 +102,61 @@ class TestUsersAndIvrEnhancements(unittest.IsolatedAsyncioTestCase):
         with patch("os.path.exists", return_value=False):
             beep = get_beep_file()
             self.assertTrue(beep.startswith("tone_stream://"))
+
+    async def test_update_user_permissions(self):
+        """update_user_permissions updates user's allowed_modules and returns updated object."""
+        from src.api.v1.users import update_user_permissions, UserPermissionsUpdate
+        user_id = uuid4()
+        tenant_id = uuid4()
+        payload = UserPermissionsUpdate(allowed_modules=["extensions", "call-routing", "reports"])
+        current_user = CurrentUser(
+            user_id="admin-id",
+            username="superadmin",
+            email="admin@pbx.com",
+            role="SUPER_ADMIN",
+            tenant_id=None
+        )
+        mock_user = {
+            "id": user_id,
+            "tenant_id": tenant_id,
+            "username": "subadmin1",
+            "email": "subadmin@test.com",
+            "first_name": "Sub",
+            "last_name": "Admin",
+            "is_active": True,
+            "role": "SUB_ADMIN",
+            "tenant_name": "Test Tenant",
+            "tenant_domain": "test.com",
+            "created_at": "2026-10-15 12:00:00"
+        }
+
+        with patch("src.api.v1.users.execute_query_one", AsyncMock(return_value=mock_user)), \
+             patch("src.api.v1.users.execute_query", AsyncMock(return_value=[])):
+            res = await update_user_permissions(user_id, payload, current_user)
+            self.assertEqual(res["id"], user_id)
+            self.assertEqual(res["allowed_modules"], ["extensions", "call-routing", "reports"])
+
+    def test_current_user_module_access(self):
+        """CurrentUser verifies module access according to role and allowed_modules."""
+        sub_admin = CurrentUser(
+            user_id="sub-1",
+            tenant_id="tenant-1",
+            username="subadmin",
+            email="sub@test.com",
+            role="SUB_ADMIN",
+            allowed_modules=["extensions", "queues"]
+        )
+        self.assertTrue(sub_admin.has_module_access("extensions"))
+        self.assertTrue(sub_admin.has_module_access("queues"))
+        self.assertFalse(sub_admin.has_module_access("call-routing"))
+
+        tenant_admin = CurrentUser(
+            user_id="admin-1",
+            tenant_id="tenant-1",
+            username="admin",
+            email="admin@test.com",
+            role="TENANT_ADMIN"
+        )
+        self.assertTrue(tenant_admin.has_module_access("call-routing"))
+        self.assertTrue(tenant_admin.has_module_access("reports"))
+
