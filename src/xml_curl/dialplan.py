@@ -4,7 +4,11 @@ import socket
 from xml.etree.ElementTree import Element, SubElement, tostring
 from typing import Dict, Any, List, Optional
 from src.core.database import execute_query_one, execute_query
-from src.services.voicemail_prompt import ensure_voicemail_prompt
+from src.services.voicemail_prompt import (
+    ensure_voicemail_prompt,
+    ensure_conference_pin_prompt,
+    ensure_conference_bad_pin_prompt
+)
 
 logger = logging.getLogger("pbx.xml_curl.dialplan")
 
@@ -419,6 +423,10 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
             conf_name = conf_row.get("name") or f"conf_{conf_ext}"
             c_mod_pin = str(conf_row.get("moderator_pin") or "").strip()
             c_part_pin = str(conf_row.get("pin") or "").strip()
+            if c_mod_pin.lower() in ("none", "null"):
+                c_mod_pin = ""
+            if c_part_pin.lower() in ("none", "null"):
+                c_part_pin = ""
             conf_tid = str(conf_row.get("tenant_id") or tenant_id or "")
             rec_conf = bool(conf_row.get("record_conference"))
 
@@ -443,7 +451,8 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
                 SubElement(cond_elem, "action", application="conference", data=f"{conf_name}@default")
             else:
                 logger.warning(f"Invalid conference PIN '{entered_pin}' for room '{conf_name}'")
-                SubElement(cond_elem, "action", application="playback", data="conference/conf-bad-pin.wav")
+                bad_pin_audio = ensure_conference_bad_pin_prompt()
+                SubElement(cond_elem, "action", application="playback", data=bad_pin_audio)
                 SubElement(cond_elem, "action", application="hangup", data="CALL_REJECTED")
             return format_xml(doc)
 
@@ -462,7 +471,13 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         conf_ext = conf_record.get("extension_number") or dest_number
         conf_name = conf_record.get("name") or f"conf_{conf_ext}"
         conf_tid = str(conf_record.get("tenant_id") or tenant_id or "")
-        has_pin = bool(conf_record.get("pin") or conf_record.get("moderator_pin"))
+        c_part_pin = str(conf_record.get("pin") or "").strip()
+        c_mod_pin = str(conf_record.get("moderator_pin") or "").strip()
+        if c_part_pin.lower() in ("none", "null"):
+            c_part_pin = ""
+        if c_mod_pin.lower() in ("none", "null"):
+            c_mod_pin = ""
+        has_pin = bool(c_part_pin or c_mod_pin)
 
         ext_elem = SubElement(context_elem, "extension", name=f"conf_entry_{conf_ext}")
         cond_elem = SubElement(ext_elem, "condition", field="destination_number", expression=".*")
@@ -472,11 +487,14 @@ async def handle_dialplan_request(form_data: Dict[str, Any]) -> str:
         SubElement(cond_elem, "action", application="sleep", data="500")
 
         if has_pin:
+            pin_audio = ensure_conference_pin_prompt()
+            bad_pin_audio = ensure_conference_bad_pin_prompt()
+            SubElement(cond_elem, "action", application="flush_dtmf")
             SubElement(
                 cond_elem,
                 "action",
                 application="play_and_get_digits",
-                data="1 10 3 5000 # conference/conf-pin.wav tone_stream://%(500,0,1000) entered_conf_pin \\d+"
+                data=f"1 10 3 5000 # {pin_audio} {bad_pin_audio} entered_conf_pin \\d+ 3000"
             )
             SubElement(cond_elem, "action", application="transfer", data=f"conf_exec_{conf_ext}_${{entered_conf_pin}} XML {context}")
         else:

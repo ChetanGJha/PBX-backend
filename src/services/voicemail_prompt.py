@@ -154,3 +154,105 @@ def ensure_ivr_prompt() -> str:
 
     # Method 4: Return tone_stream if no sound file can be generated
     return "tone_stream://%(2000,4000,440,480)"
+
+
+CONF_PIN_FALLBACK = "/var/lib/freeswitch/recordings/prompts/conf_pin.wav"
+CONF_BAD_PIN_FALLBACK = "/var/lib/freeswitch/recordings/prompts/conf_bad_pin.wav"
+
+
+def ensure_conference_pin_prompt() -> str:
+    """
+    Ensures a conference PIN prompt audio file exists:
+    'Please enter your conference PIN number, followed by pound.'
+    Returns absolute path or Callie system path.
+    """
+    try:
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+    target_wav = CONF_PIN_FALLBACK
+    if os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+        return target_wav
+
+    # Check Callie system sounds first
+    for callie_path in (
+        "/usr/share/freeswitch/sounds/en/us/callie/conference/8000/conf-pin.wav",
+        "/usr/share/freeswitch/sounds/en/us/callie/conference/conf-pin.wav"
+    ):
+        if os.path.exists(callie_path) and os.path.getsize(callie_path) > 1000:
+            return callie_path
+
+    phrase = "Please enter your conference PIN number, followed by pound."
+
+    # Method 1: Google TTS
+    try:
+        url = "https://translate.google.com/translate_tts"
+        params = {"ie": "UTF-8", "q": phrase, "tl": "en", "client": "tw-ob"}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = httpx.get(url, params=params, headers=headers, timeout=5.0)
+        if r.status_code == 200 and len(r.content) > 500:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", target_wav],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            proc.communicate(input=r.content)
+            if proc.returncode == 0 and os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+                logger.info(f"Successfully generated dynamic conference PIN prompt: {target_wav}")
+                return target_wav
+    except Exception as e:
+        logger.warning(f"Google TTS generation failed for conf PIN prompt: {e}")
+
+    # Fallback to relative Callie path or tone stream
+    return "conference/conf-pin.wav"
+
+
+def ensure_conference_bad_pin_prompt() -> str:
+    """
+    Ensures a conference bad PIN prompt audio file exists:
+    'That PIN is invalid. Goodbye.'
+    Returns absolute path or Callie system path.
+    """
+    try:
+        os.makedirs(PROMPTS_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+    target_wav = CONF_BAD_PIN_FALLBACK
+    if os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+        return target_wav
+
+    # Check Callie system sounds first
+    for callie_path in (
+        "/usr/share/freeswitch/sounds/en/us/callie/conference/8000/conf-bad-pin.wav",
+        "/usr/share/freeswitch/sounds/en/us/callie/conference/conf-bad-pin.wav"
+    ):
+        if os.path.exists(callie_path) and os.path.getsize(callie_path) > 1000:
+            return callie_path
+
+    phrase = "That PIN is invalid. Goodbye."
+
+    # Method 1: Google TTS
+    try:
+        url = "https://translate.google.com/translate_tts"
+        params = {"ie": "UTF-8", "q": phrase, "tl": "en", "client": "tw-ob"}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = httpx.get(url, params=params, headers=headers, timeout=5.0)
+        if r.status_code == 200 and len(r.content) > 500:
+            proc = subprocess.Popen(
+                ["ffmpeg", "-y", "-i", "pipe:0", "-ar", "8000", "-ac", "1", "-c:a", "pcm_s16le", target_wav],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            proc.communicate(input=r.content)
+            if proc.returncode == 0 and os.path.exists(target_wav) and os.path.getsize(target_wav) > 1000:
+                logger.info(f"Successfully generated dynamic conference bad PIN prompt: {target_wav}")
+                return target_wav
+    except Exception as e:
+        logger.warning(f"Google TTS generation failed for conf bad PIN prompt: {e}")
+
+    return "conference/conf-bad-pin.wav"
+
